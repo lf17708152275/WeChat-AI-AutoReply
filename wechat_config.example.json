@@ -1,48 +1,86 @@
 {
-    "ai_engine": "openai_api",
-    "openai_api": {
-        "api_key": "",
-        "api_base": "https://api.xiaomimimo.com/v1",
-        "model": "mimo-v2.6-flash",
-        "temperature": 0.7
+  "ai_engine": "openai_api",
+  "openai_api": {
+    "api_key": "",
+    "api_base": "https://api.xiaomimimo.com/v1",
+    "model": "mimo-v2.6-flash",
+    "temperature": 0.7
+  },
+  "system_prompt": "你现在是微信账号的主人（真实本人）。请以我（主人本人）的第一人称、自然口语、亲切随和的日常语气直接回复微信好友的消息。就像我本人在用手机打字聊天一样自然。严禁透露任何AI、机器人或助理身份，严禁使用客套机械的客服腔，严禁输出任何解释或markdown格式，直接输出我回复的那句话。",
+  "reply_prefix": "[AI自动回复] ",
+  "include_prefix": false,
+  "whitelist_mode": true,
+  "contacts": [
+    {
+      "remark": "好友备注A",
+      "wxid": "wxid_xxxxxxxx"
     },
-    "system_prompt": "你现在是微信账号的主人（真实本人）。请以我（主人本人）的第一人称、自然口语、亲切随和的日常语气直接回复微信好友的消息。就像我本人在用手机打字聊天一样自然。严禁透露任何AI、机器人或助理身份，严禁使用客套机械的客服腔，严禁输出任何解释或markdown格式，直接输出我回复的那句话。",
-    "reply_prefix": "[AI自动回复] ",
-    "include_prefix": false,
-    "whitelist_mode": true,
-    "whitelist": [
-        "好友备注A",
-        "好友备注B"
-    ],
-    "blacklist": [
-        "微信团队",
-        "文件传输助手",
-        "腾讯新闻",
-        "微信支付",
-        "服务通知",
-        "订阅号消息"
-    ],
-    "reply_delay_seconds": 0.0,
-    "check_interval_seconds": 0.5,
-    "auto_focus_wechat": false,
-    "ignored_keywords": [
-        "按住鼠标",
-        "语音输入文字",
-        "按住说话",
-        "按Enter发送",
-        "发送(S)"
-    ],
-    "friend_personas": {
-        "好兄弟A": "死党互损模式：说话幽默随和、接地气、开玩笑、互怼互损，称呼自然，绝不客套拘谨",
-        "老同学B": "知心朋友模式：语气温柔活泼、偶尔俏皮、关心对方、真诚幽默",
-        "商务客户C": "商务礼貌模式：专业得体、谦逊礼貌、响应迅速、办事靠谱",
-        "相亲对象D": "温柔幽默模式：体贴细心、情商高、自然幽默、随和温暖",
-        "默认": "真人好友模式：语气自然随和、口语化、真诚得体"
-    },
-    "saved_window_rect": [
-        100,
-        100,
-        1100,
-        750
+    {
+      "remark": "好友备注B",
+      "wxid": ""
+    }
+  ],
+  "whitelist": [
+    "好友备注A",
+    "好友备注B"
+  ],
+  "blacklist": [
+    "微信团队",
+    "文件传输助手",
+    "腾讯新闻",
+    "微信支付",
+    "服务通知",
+    "订阅号消息"
+  ],
+  "reply_delay_seconds": 0.0,
+  "check_interval_seconds": 0.5,
+  "auto_focus_wechat": false,
+  "ignored_keywords": [
+    "按住鼠标",
+    "语音输入文字",
+    "按住说话",
+    "按Enter发送",
+    "发送(S)"
+  ],
+  "agent": {
+    "enabled": true,
+    "url": "http://127.0.0.1:44708/a2a",
+    "card_url": "http://127.0.0.1:44708/.well-known/agent-card.json",
+    "context_prefix": "wx-",
+    "timeout_seconds": 180,
+    "connect_timeout_seconds": 5,
+    "retries": 1,
+    "max_defer_seconds": 900,
+    "context_map_file": "wechat_agent_contexts.json",
+    "fallback_replies": [
+      "嘿嘿，我这会儿有点懵，等下再聊~",
+      "啊呀，脑子突然卡壳了，晚点回你哈",
+      "我这边有点小状况，一会儿再来找你~",
+      "等等我，手头有点事，马上回来！"
     ]
+  },
+  "proactive_send": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "whitelist_only": true,
+    "max_per_hour": 3,
+    "max_per_day": 20,
+    "require_confirm": false,
+    "allow_search": true,
+    "confirm_expire_hours": 12
+  },
+  "friend_personas": {
+    "好兄弟A": "死党互损模式：说话幽默随和、接地气、开玩笑、互怼互损，称呼自然，绝不客套拘谨",
+    "老同学B": "知心朋友模式：语气温柔活泼、偶尔俏皮、关心对方、真诚幽默",
+    "商务客户C": "商务礼貌模式：专业得体、谦逊礼貌、响应迅速、办事靠谱",
+    "相亲对象D": "温柔幽默模式：体贴细心、情商高、自然幽默、随和温暖",
+    "默认": "真人好友模式：语气自然随和、口语化、真诚得体"
+  },
+  "saved_window_rect": [
+    100,
+    100,
+    1100,
+    750
+  ]
 }

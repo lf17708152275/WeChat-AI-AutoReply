@@ -104,6 +104,10 @@ python wechat_ai_bot_dev.py
         "temperature": 0.7
     },
     "whitelist_mode": true,
+    "contacts": [
+        {"remark": "好友微信备注名A", "wxid": "wxid_aaaaaaaaaaaa"},
+        {"remark": "好友微信备注名B", "wxid": ""}
+    ],
     "whitelist": [
         "好友微信备注名A",
         "好友微信备注名B"
@@ -116,6 +120,155 @@ python wechat_ai_bot_dev.py
 }
 ```
 
+### 📇 通讯录映射（备注 + 微信号）
+
+`contacts` 是白名单的进化版。它解决两个纯 OCR 链路的老问题：
+
+| 问题 | `whitelist` 纯字符串 | `contacts` 带 `wxid` |
+|---|---|---|
+| 两个人重名 | ❌ 可能点错人 | ✅ 自定义微信号可搜，唯一 |
+| 改了备注 | ❌ 记忆断了 / 要改配置 | ✅ 会话键用微信号，记忆不断 |
+| 中文名字当会话键 | ❌ DSH A2A 建会话失败 | ✅ 微信号是 ASCII，天然稳 |
+
+规则：
+
+- `remark` = 微信里显示的名字（**有备注就填备注**），参与白名单匹配
+- `wxid` = 微信号，**可选**。填了就用它做 Agent 会话键
+- **搜索键（Ctrl+F）**：只认「自己改过的微信号」。
+  微信官方下发的 `wxid_xxx` 这类**搜不到本地联系人**（只会给出「网络查找微信号」网页结果），
+  所以 `wxid_` 开头的会自动降级改用 `remark` 搜；自定义微信号搜不到时也会再降级用 `remark` 重搜一次。
+- 白名单 = `contacts` 的 `remark` **∪** 旧 `whitelist` 字符串，两者都写也能用
+- 只想用 `contacts`，把 `whitelist` 设成 `[]` 即可
+- 也支持纯字符串写法：`"contacts": ["张三", "李四"]`
+
+**怎么拿微信号**：微信里点开该好友聊天 → 点顶栏名字 → 个人信息页里「微信号」那一行。
+
+**DSH 侧随手改通讯录**（bot 运行时）：
+
+```bash
+# 读
+curl http://127.0.0.1:8765/contacts
+# 单条新增/覆盖
+curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" \
+  -d '{"remark":"张三","wxid":"zhangsan_88"}'
+# 整体替换
+curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" \
+  -d '{"contacts":[{"remark":"张三","wxid":"zhangsan_88"}]}'
+# 删除一条
+curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" \
+  -d '{"remove":"张三"}'
+```
+
+改完立即生效，不用重启 bot（每次读配置都重新读文件）。
+
+### 🧠 Agent 大脑（可选，推荐）
+
+把「直接调模型」换成「交给一个真正的 Agent 决策」。Agent 不只回话，还能自己判断
+**要不要回**、**什么时候回**，返回结构化决策而不是一段文本。
+
+```json
+{
+    "agent": {
+        "enabled": true,
+        "url": "http://127.0.0.1:44708/a2a",
+        "card_url": "http://127.0.0.1:44708/.well-known/agent-card.json",
+        "context_prefix": "wx-",
+        "timeout_seconds": 180,
+        "max_defer_seconds": 900,
+        "fallback_replies": [
+            "嘿嘿，我这会儿有点懵，等下再聊~",
+            "啊呀，脑子突然卡壳了，晚点回你哈"
+        ]
+    }
+}
+```
+
+Agent 返回的契约（一行 JSON）：
+
+```json
+{"action": "reply|ignore|defer", "text": "回复内容", "urgency": "now|soon|later", "reason": "一句话理由"}
+```
+
+| action | 含义 | 机器人行为 |
+| --- | --- | --- |
+| `reply` | 该回 | 按 `urgency` 延迟后发送 |
+| `ignore` | 不用回（广告 / 晚安 / 单纯一个「嗯」） | 不发，但记下签名防止重复处理 |
+| `defer` | 该回但现在不合适 | 延后重试，超过 `max_defer_seconds` 放弃 |
+
+- `urgency` → 延迟：`now` 立即 / `soon` 30–90 秒 / `later` 3–15 分钟（带 ±20% 抖动）。
+- **Agent 不可用时**：记 ERROR 日志 + 发一条 `fallback_replies` 里的固定可爱回复，不会静默，也不会退回旧的直连模型。
+- **并发**：每个联系人一个 `contextId`，多线程并行决策，互不阻塞。
+- `contextId` 只允许 ASCII，中文昵称会自动哈希成 `wx-u<sha1前12位>`，映射表落在 `wechat_agent_contexts.json`。
+
+### 📤 主动发送（可选）
+
+让 Agent / 外部脚本主动给指定好友发消息，不需要等对方先开口。
+
+```json
+{
+    "proactive_send": {
+        "enabled": false,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "whitelist_only": true,
+        "max_per_hour": 3,
+        "max_per_day": 20,
+        "require_confirm": false,
+        "allow_search": true,
+        "confirm_expire_hours": 12
+    }
+}
+```
+
+HTTP 接口（只监听 `127.0.0.1`）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/status` | 运行状态、本小时/今日已发条数、待确认数 |
+| GET | `/pending` | 待人工确认的消息列表 |
+| POST | `/send` | `{"target":"张三","text":"在忙吗？"}` 发一条 |
+| POST | `/confirm` | `{"id":"p1730..."}` 人工确认后发送 |
+| POST | `/reject` | `{"id":"p1730...","reason":"算了"}` 丢弃 |
+
+请求体支持三种写法，随便挑一种：
+
+```bash
+# 1) 标准 JSON
+curl -X POST http://127.0.0.1:8765/send -H "Content-Type: application/json" \
+     -d '{"target":"张三","text":"在忙吗？"}'
+
+# 2) 表单（注意是 = 不是 :，中文无需转义）
+curl -X POST http://127.0.0.1:8765/send -d "target=张三&text=在忙吗？"
+
+# 3) 直接挂在 query 上（Windows 命令行最不容易出错的一种）
+curl -X POST "http://127.0.0.1:8765/send?target=张三&text=在忙吗？"
+```
+
+> **Windows 命令行两个坑，服务端都已兜住：**
+>
+> 1. **引号被吃掉**：PowerShell 会把 `-d '{"target":"张三"}'` 里的双引号吃掉，
+>    服务端只收到 `{target:张三}`，于是返回 `{"ok":false,"code":"bad_json"}`。
+> 2. **终端编码是 GBK**：`curl -d "target=微信 2"` 发出去的是 GBK 字节，
+>    按 UTF-8 解会变成 `΢�� 2`，白名单匹配不上 → `{"ok":false,"code":"not_whitelisted"}`。
+>    服务端会自动在 UTF-8 / GB18030 之间择优解码。
+>
+> 所以三种写法里，**写法 3（挂在 query 上）最稳**；也可以用 PowerShell 原生 cmdlet：
+>
+> ```powershell
+> Invoke-RestMethod -Uri http://127.0.0.1:8765/send -Method Post `
+>   -ContentType "application/json" `
+>   -Body (@{target="张三"; text="在忙吗？"} | ConvertTo-Json)
+> ```
+
+**安全护栏**（写在代码里，不靠配置自觉）：
+
+1. 群聊、黑名单、系统号（文件传输助手 / 服务通知…）**永远拒绝**，即使关掉 `whitelist_only`。
+2. 白名单严格匹配，`张三` 不会误命中 `张三丰`。
+3. 频率上限 `max_per_hour` / `max_per_day`，超了直接 403。
+4. 找人走三级策略（顶栏已是目标 → 侧栏可见行 → Ctrl+F 搜索），**每一步都要复核顶栏标题**，复核不过就放弃，宁可发不出去也绝不发错人。
+5. 发送失败不记账（不占配额）。
+6. `require_confirm: true` 时，消息落到 `pending_confirm.jsonl`，GUI 每 2 秒轮询并弹窗，你点「发送」才真发。人工确认**只**绕过确认这一道，白名单和频率照旧。
+
 ---
 
 ## 📁 仓库结构
@@ -123,8 +276,11 @@ python wechat_ai_bot_dev.py
 ```text
 WeChat-AI-AutoReply/
 ├── wechat_ai_bot_dev.py          # 后台常驻感知与调度核心 (OCR+Win32消息路由+离屏抓图)
-├── wechat_bot_gui_dev.py         # 现代化控制中心 GUI (Tkinter + 实时日志 + 托盘控制)
+├── wechat_bot_gui_dev.py         # 现代化控制中心 GUI (Tkinter + 实时日志 + 待确认弹窗)
+├── agent_client.py               # Agent 大脑客户端 (A2A 协议 + JSON 契约 + 降级兜底)
 ├── kill_wechat_bot_dev.py        # 安全进程清理终结脚本 (精准定向关闭守护)
+├── Linux移植规划.md              # Linux 平台移植调研与实施方案（已调研，未开工）
+├── 下一步详细方案.md              # P1 群聊 / P2 群聊回复 / P3 人格关系 / P5 收尾 的详细设计
 ├── wechat_config.example.json    # 工业级通用脱敏配置文件模板
 ├── .env.example                  # 环境变量配置模板
 ├── requirements.txt              # Python 依赖清单
@@ -132,6 +288,54 @@ WeChat-AI-AutoReply/
 ├── LICENSE                       # MIT 开源许可证
 └── README.md                     # 项目说明文档
 ```
+
+### 🧪 回归测试
+
+```bash
+python 回归测试_防串发匹配.py    # 防串发 / 名字匹配 / 气泡解析
+python 回归测试_通讯录映射.py    # contacts 解析、备注↔微信号、白名单并集、/contacts 接口
+python 回归测试_Agent大脑.py     # Agent 客户端、契约解析、降级、并发总线
+python 回归测试_主动发送.py      # 主动发送护栏、HTTP 接口、找人三级策略
+python 回归测试_待确认队列.py    # 待确认队列落盘/恢复/确认/拒绝/过期
+python 回归测试_待确认GUI.py     # GUI 侧队列读写与接口对齐
+```
+
+联调（需要 DSH 的 A2A 服务在跑）：
+
+```bash
+python 联调脚本_真实Agent.py     # 提交 -> 后台决策 -> 取回 -> 发送/不发 全链路
+```
+
+---
+
+## 🗺️ 下一步规划 (Roadmap)
+
+按 P1 → P5 推进。**硬约束**：每项完成后六套回归必须全绿 + Windows 真机冒烟一轮。
+
+| 优先级 | 事项 | 一句话目标 | 状态 | 预估 |
+|---|---|---|---|---|
+| P1 | 群聊主动发送 | `POST /send` 能把消息发进指定群 | 待做 | 0.5 天 |
+| P2 | 群聊自动回复 | 群里 @我 或命中关键词时自动回复，且不刷屏 | 待做 | 1.5 天 |
+| P3 | 人格 / 关系字段 | 按「和这个人的关系」改变说话语气 | 待做 | 0.5 天 |
+| P4 | Linux 适配 | 在 Linux 微信上跑通同一套能力（键盘流） | 已调研，未开工 | 1.5 ~ 2 天 |
+| P5 | 工程收尾 | 清探针、一键回归、日志分离 | 待做 | 0.5 天 |
+
+详细方案：
+
+- P1 / P2 / P3 / P5 → **[下一步详细方案.md](下一步详细方案.md)**
+- P4 Linux → **[Linux移植规划.md](Linux移植规划.md)**
+
+---
+
+## 🐧 跨平台说明
+
+当前版本仅支持 **Windows**（底层依赖 `user32` / `gdi32` 抓图与消息投递）。
+
+Linux 版微信的移植已完成可行性调研，结论是**可行，但输入层必须从"鼠标点击"改成"纯键盘驱动"**
+（XTest 合成点击不被 Linux 版微信接受，但键盘事件正常）。完整实测数据、平台层设计、
+依赖清单、踩坑记录与验收标准见 **[Linux移植规划.md](Linux移植规划.md)**。
+
+> 状态：已调研，未开工。
 
 ---
 

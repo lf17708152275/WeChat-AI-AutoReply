@@ -5,6 +5,9 @@ import time
 import re
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import psutil
 import requests
 import ctypes
@@ -25,7 +28,71 @@ CONFIG_FILE = os.path.join(WORKSPACE_DIR, "wechat_config_dev.json")
 LOG_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.log")
 PID_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.pid")
 BOT_SCRIPT = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.py")
+
+_K32 = None
+
+
+def _kernel32():
+    """带完整原型的 kernel32，避免 64 位句柄被 ctypes 默认 c_int 截断。"""
+    global _K32
+    if _K32 is None:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, ctypes.c_wchar_p,
+            ctypes.POINTER(wintypes.DWORD)]
+        _K32 = k32
+    return _K32
+
+
+def fast_process_names():
+    """毫秒级返回 {pid: exe 文件名}。
+
+    `psutil.process_iter(['pid','name'])` 在本机 419 个进程上要 **3.9 秒**，
+    这是「点启动/停止卡一下」的真正元凶；而 EnumProcesses +
+    QueryFullProcessImageNameW 只要 **0.04 秒**（实测快 100 倍）。
+    取不到名字的（系统保护进程）直接跳过，它们不可能是我们的 python 守护。
+    """
+    names = {}
+    try:
+        arr = (ctypes.c_ulong * 8192)()
+        needed = wintypes.DWORD(0)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.EnumProcesses.restype = wintypes.BOOL
+        psapi.EnumProcesses.argtypes = [
+            ctypes.POINTER(ctypes.c_ulong), wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)]
+        if not psapi.EnumProcesses(
+                ctypes.cast(arr, ctypes.POINTER(ctypes.c_ulong)),
+                ctypes.sizeof(arr), ctypes.byref(needed)):
+            return names
+        total = needed.value // ctypes.sizeof(ctypes.c_ulong)
+    except Exception:
+        return names
+
+    k32 = _kernel32()
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    for i in range(total):
+        pid = arr[i]
+        if not pid:
+            continue
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            continue
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                names[int(pid)] = os.path.basename(buf.value)
+        finally:
+            k32.CloseHandle(h)
+    return names
 KILL_SCRIPT = os.path.join(WORKSPACE_DIR, "kill_wechat_bot_dev.py")
+PENDING_FILE = os.path.join(WORKSPACE_DIR, "pending_confirm.jsonl")
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -126,9 +193,11 @@ DEFAULT_PROMPTS = {
 class WeChatBotGUI(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._after_ids = []
+        self._closing = False
         self.title("微信AI自动回复")
-        self.geometry("980x720")
-        self.minsize(920, 640)
+        self.geometry("1320x880")
+        self.minsize(1180, 760)
         
         ico_file = os.path.join(WORKSPACE_DIR, "wechat_sky_blue_unread_ai_v4.ico")
         if os.path.exists(ico_file):
@@ -146,11 +215,56 @@ class WeChatBotGUI(tk.Tk):
         self.config_data = self.load_config()
         self.log_pos = 0
         self.is_monitoring = True
-        
+        self._confirm_dialog_open = False
+
         self.create_widgets()
         self.load_settings_to_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.start_background_monitors()
+        # P3: 待确认消息轮询（2 秒一次，有就弹窗）
+        self._safe_after(2500, self.poll_pending_confirm)
+
+    def _ui_call(self, fn, delay=0):
+        """后台线程回主线程改 UI 的安全版本（窗口已关闭 / 无 mainloop 时静默跳过）。"""
+        def _guarded():
+            try:
+                fn()
+            except Exception:
+                pass
+        try:
+            self.after(delay, _guarded)
+        except Exception:
+            pass
+
+    def _safe_after(self, ms, fn):
+        """登记 after 定时器，关窗时统一取消，避免 Tk 打印 invalid command name 堆栈。"""
+        if getattr(self, "_closing", False):
+            return None
+        try:
+            aid = self.after(ms, fn)
+        except Exception:
+            return None
+        try:
+            self._after_ids.append(aid)
+        except Exception:
+            pass
+        return aid
+
+    def destroy(self):
+        self._closing = True
+        for aid in list(getattr(self, "_after_ids", [])):
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+        try:
+            self._after_ids.clear()
+        except Exception:
+            pass
+        try:
+            super().destroy()
+        except Exception:
+            pass
 
     def on_close(self):
         try:
@@ -183,6 +297,7 @@ class WeChatBotGUI(tk.Tk):
             "include_prefix": False,
             "whitelist_mode": True,
             "whitelist": [],
+            "contacts": [],
             "blacklist": [
                 "微信团队",
                 "文件传输助手",
@@ -200,7 +315,37 @@ class WeChatBotGUI(tk.Tk):
                 "按住说话",
                 "按Enter发送",
                 "发送(S)"
-            ]
+            ],
+            # 下面两块 GUI 界面里不编辑，但必须原样带回来，
+            # 否则用户点一次「保存」就会把它们从配置文件里抹掉。
+            "agent": {
+                "enabled": True,
+                "url": "http://127.0.0.1:44708/a2a",
+                "card_url": "http://127.0.0.1:44708/.well-known/agent-card.json",
+                "context_prefix": "wx-",
+                "timeout_seconds": 180,
+                "connect_timeout_seconds": 5,
+                "retries": 1,
+                "max_defer_seconds": 900,
+                "context_map_file": "wechat_agent_contexts.json",
+                "fallback_replies": [
+                    "嘿嘿，我这会儿有点懵，等下再聊~",
+                    "啊呀，脑子突然卡壳了，晚点回你哈",
+                    "我这边有点小状况，一会儿再来找你~",
+                    "等等我，手头有点事，马上回来！"
+                ]
+            },
+            "proactive_send": {
+                "enabled": False,
+                "host": "127.0.0.1",
+                "port": 8765,
+                "whitelist_only": True,
+                "max_per_hour": 3,
+                "max_per_day": 20,
+                "require_confirm": False,
+                "allow_search": True,
+                "confirm_expire_hours": 12
+            }
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -212,6 +357,8 @@ class WeChatBotGUI(tk.Tk):
                     default["whitelist"] = [w for w in wl if isinstance(w, str)] if isinstance(wl, list) else []
                     bl = default.get("blacklist")
                     default["blacklist"] = [b for b in bl if isinstance(b, str)] if isinstance(bl, list) else []
+                    ct = default.get("contacts")
+                    default["contacts"] = ct if isinstance(ct, list) else []
             except Exception as e:
                 print(f"Error loading config: {e}")
         return default
@@ -262,17 +409,23 @@ class WeChatBotGUI(tk.Tk):
 
         self.tab_engine = ttk.Frame(self.notebook, padding=12)
         self.tab_prompt = ttk.Frame(self.notebook, padding=12)
+        self.tab_contacts = ttk.Frame(self.notebook, padding=12)
         self.tab_whitelist = ttk.Frame(self.notebook, padding=12)
+        self.tab_agent = ttk.Frame(self.notebook, padding=12)
         self.tab_test = ttk.Frame(self.notebook, padding=12)
 
         self.notebook.add(self.tab_engine, text=" ⚙️ AI 引擎设置 ")
         self.notebook.add(self.tab_prompt, text=" 🎭 人设与指令 Prompt ")
         self.notebook.add(self.tab_whitelist, text=" 🌓 白名单与防扰 ")
         self.notebook.add(self.tab_test, text=" 🧪 AI 仿真测试沙盒 ")
+        self.notebook.add(self.tab_contacts, text=" 📇 通讯录映射 ")
+        self.notebook.add(self.tab_agent, text=" 🤖 大脑 / 主动发送 ")
 
         self.build_tab_engine()
         self.build_tab_prompt()
+        self.build_tab_contacts()
         self.build_tab_whitelist()
+        self.build_tab_agent()
         self.build_tab_test()
 
         # Bottom Log Viewer
@@ -386,15 +539,67 @@ class WeChatBotGUI(tk.Tk):
         btn_p.pack(fill=tk.X, pady=8)
         ttk.Button(btn_p, text="💾 保存人设 Prompt", command=self.save_ui_to_config).pack(side=tk.RIGHT)
 
-    # 3. TAB: Whitelist
+    # 3. TAB: Contacts
+    def build_tab_contacts(self):
+        ttk.Label(
+            self.tab_contacts,
+            text="📇 备注 ↔ 微信号 映射表：填了微信号就优先用它去搜索找人；搜不到会自动降级用备注重搜。",
+            font=("微软雅黑", 9, "bold"),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(
+            self.tab_contacts,
+            text="· 备注 = 微信里显示的名字（有备注就填备注，没有就填昵称）\n"
+                 "· 微信号只有「你自己改过的」才能搜到；微信官方下发的 wxid_ 开头的搜不到，会自动降级用备注\n"
+                 "· 这里的备注会自动并入白名单 —— 也就是说，填进来的人才会被自动回复",
+            foreground="#666666", font=("微软雅黑", 8), justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        body = ttk.Frame(self.tab_contacts)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 先 pack 固定宽度的右侧面板，再 pack 可伸缩的左侧列表，否则 expand 会把右侧挤出去
+        right = ttk.LabelFrame(body, text=" 新增 / 编辑 ", padding=8)
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+
+        left = ttk.LabelFrame(body, text=" 通讯录清单 ", padding=8)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+
+        self.tree_contacts = ttk.Treeview(left, columns=("remark", "wxid"), show="headings", height=10)
+        self.tree_contacts.heading("remark", text="备注（微信显示名）")
+        self.tree_contacts.heading("wxid", text="微信号 / 自定义号（可留空）")
+        self.tree_contacts.column("remark", width=200, anchor=tk.W)
+        self.tree_contacts.column("wxid", width=240, anchor=tk.W)
+        self.tree_contacts.pack(fill=tk.BOTH, expand=True)
+        self.tree_contacts.bind("<<TreeviewSelect>>", self.on_contact_select)
+
+        row1 = ttk.Frame(right)
+        row1.pack(fill=tk.X, pady=3)
+        ttk.Label(row1, text="备注:", width=8).pack(side=tk.LEFT)
+        self.ent_ct_remark = ttk.Entry(row1, width=24)
+        self.ent_ct_remark.pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(right)
+        row2.pack(fill=tk.X, pady=3)
+        ttk.Label(row2, text="微信号:", width=8).pack(side=tk.LEFT)
+        self.ent_ct_wxid = ttk.Entry(row2, width=24)
+        self.ent_ct_wxid.pack(side=tk.LEFT)
+
+        btns = ttk.Frame(right)
+        btns.pack(fill=tk.X, pady=(10, 3))
+        ttk.Button(btns, text="➕ 添加 / 更新", command=self.add_contact).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="🗑️ 删除选中", command=self.del_contact).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="📥 从白名单导入", command=self.import_contacts_from_whitelist).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="💾 保存通讯录", command=self.save_ui_to_config).pack(fill=tk.X, pady=(12, 2))
+
+    # 4. TAB: Whitelist
     def build_tab_whitelist(self):
         top_w = ttk.Frame(self.tab_whitelist)
         top_w.pack(fill=tk.X, pady=(0, 6))
 
         self.var_wl_mode = tk.BooleanVar(value=True)
         self.chk_wl = ttk.Checkbutton(top_w, text="🔒 开启白名单模式（开启后【仅回复】白名单中的指定好友，未在名单者不回复）", variable=self.var_wl_mode)
-        self.chk_wl.pack(side=tk.LEFT)
-        ttk.Label(top_w, text="⚠️ 关闭白名单模式后将回复所有单人好友（群聊/黑名单除外，群聊识别为启发式无法100%拦截），建议仅测试时使用", foreground="#c0392b", font=("微软雅黑", 8)).pack(side=tk.LEFT, padx=12)
+        self.chk_wl.pack(anchor=tk.W)
+        ttk.Label(top_w, text="⚠️ 关闭白名单模式后将回复所有单人好友（群聊/黑名单除外，群聊识别为启发式无法100%拦截），建议仅测试时使用", foreground="#c0392b", font=("微软雅黑", 8), wraplength=900, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
 
         mid_w = ttk.Frame(self.tab_whitelist)
         mid_w.pack(fill=tk.BOTH, expand=True, pady=4)
@@ -402,6 +607,11 @@ class WeChatBotGUI(tk.Tk):
         # Left: Whitelist
         left_w = ttk.LabelFrame(mid_w, text=" 🟢 允许自动回复的好友白名单 ", padding=8)
         left_w.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+
+        self.lbl_wl_derived = ttk.Label(
+            left_w, text="", foreground="#1a73e8", font=("微软雅黑", 8),
+            wraplength=560, justify=tk.LEFT)
+        self.lbl_wl_derived.pack(anchor=tk.W, pady=(0, 4))
 
         self.listbox_wl = tk.Listbox(left_w, selectmode=tk.SINGLE, font=("微软雅黑", 9))
         self.listbox_wl.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
@@ -427,7 +637,92 @@ class WeChatBotGUI(tk.Tk):
         ttk.Button(bl_ctrl, text="添加屏蔽", command=self.add_blacklist).pack(side=tk.LEFT, padx=2)
         ttk.Button(bl_ctrl, text="删除选中", command=self.del_blacklist).pack(side=tk.LEFT, padx=2)
 
-    # 4. TAB: Test Sandbox
+    # 5. TAB: Agent brain & proactive send
+    def build_tab_agent(self):
+        agent_box = ttk.LabelFrame(self.tab_agent, text=" 🤖 DSH Agent 大脑（由 Agent 决定回不回、回什么、什么时候回） ", padding=10)
+        agent_box.pack(fill=tk.X, pady=(0, 8))
+
+        row_a0 = ttk.Frame(agent_box)
+        row_a0.pack(fill=tk.X, pady=3)
+        self.var_agent_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row_a0, text="启用 Agent 大脑（关闭则退回「AI 引擎设置」里的大模型直连）",
+                        variable=self.var_agent_enabled).pack(side=tk.LEFT)
+
+        row_a1 = ttk.Frame(agent_box)
+        row_a1.pack(fill=tk.X, pady=3)
+        ttk.Label(row_a1, text="A2A 地址:", width=12).pack(side=tk.LEFT)
+        self.ent_agent_url = ttk.Entry(row_a1)
+        self.ent_agent_url.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Button(row_a1, text="🔌 测试连接", command=self.test_agent_connection).pack(side=tk.RIGHT)
+
+        row_a2 = ttk.Frame(agent_box)
+        row_a2.pack(fill=tk.X, pady=3)
+        ttk.Label(row_a2, text="contextId 前缀:", width=12).pack(side=tk.LEFT)
+        self.ent_agent_prefix = ttk.Entry(row_a2, width=8)
+        self.ent_agent_prefix.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(row_a2, text="超时(秒):").pack(side=tk.LEFT, padx=(0, 4))
+        self.spin_agent_timeout = ttk.Spinbox(row_a2, from_=10, to=600, increment=10, width=6)
+        self.spin_agent_timeout.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(row_a2, text="最长延迟发送(秒):").pack(side=tk.LEFT, padx=(0, 4))
+        self.spin_agent_defer = ttk.Spinbox(row_a2, from_=60, to=86400, increment=60, width=8)
+        self.spin_agent_defer.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(row_a2, text="每好友独立会话（中文名自动哈希）",
+                  foreground="#666666", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+
+        ttk.Label(agent_box, text="Agent 失联时的兜底回复（每行一条，随机发）：",
+                  font=("微软雅黑", 8)).pack(anchor=tk.W, pady=(8, 0))
+        self.txt_agent_fallback = tk.Text(agent_box, height=4, font=("微软雅黑", 9), wrap=tk.WORD)
+        self.txt_agent_fallback.pack(fill=tk.X, pady=(2, 0))
+
+        pro_box = ttk.LabelFrame(self.tab_agent, text=" 📤 主动发送接口（只监听本机，外部脚本 / Agent 主动发消息用） ", padding=10)
+        pro_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        row_p0 = ttk.Frame(pro_box)
+        row_p0.pack(fill=tk.X, pady=3)
+        self.var_pro_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row_p0, text="启用主动发送接口", variable=self.var_pro_enabled).pack(side=tk.LEFT, padx=(0, 18))
+        self.var_pro_wl_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row_p0, text="仅限白名单 / 通讯录", variable=self.var_pro_wl_only).pack(side=tk.LEFT, padx=(0, 18))
+        self.var_pro_confirm = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row_p0, text="需要人工确认后才发", variable=self.var_pro_confirm).pack(side=tk.LEFT, padx=(0, 18))
+        self.var_pro_search = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row_p0, text="找不到时用搜索找人", variable=self.var_pro_search).pack(side=tk.LEFT)
+
+        row_p1 = ttk.Frame(pro_box)
+        row_p1.pack(fill=tk.X, pady=3)
+        ttk.Label(row_p1, text="监听地址:", width=10).pack(side=tk.LEFT)
+        self.ent_pro_host = ttk.Entry(row_p1, width=14)
+        self.ent_pro_host.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(row_p1, text="端口:").pack(side=tk.LEFT, padx=(0, 4))
+        self.spin_pro_port = ttk.Spinbox(row_p1, from_=1024, to=65535, increment=1, width=8)
+        self.spin_pro_port.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(row_p1, text="每小时上限:").pack(side=tk.LEFT, padx=(0, 4))
+        self.spin_pro_hour = ttk.Spinbox(row_p1, from_=1, to=200, increment=1, width=6)
+        self.spin_pro_hour.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(row_p1, text="每天上限:").pack(side=tk.LEFT, padx=(0, 4))
+        self.spin_pro_day = ttk.Spinbox(row_p1, from_=1, to=2000, increment=1, width=6)
+        self.spin_pro_day.pack(side=tk.LEFT)
+
+        row_p2 = ttk.Frame(pro_box)
+        row_p2.pack(fill=tk.X, pady=(12, 3))
+        ttk.Label(row_p2, text="🧪 立即测试:", font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row_p2, text="发给:").pack(side=tk.LEFT)
+        self.ent_pro_test_target = ttk.Entry(row_p2, width=16)
+        self.ent_pro_test_target.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(row_p2, text="内容:").pack(side=tk.LEFT)
+        self.ent_pro_test_text = ttk.Entry(row_p2)
+        self.ent_pro_test_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
+        ttk.Button(row_p2, text="📨 发送", command=self.send_proactive_test).pack(side=tk.RIGHT)
+
+        self.lbl_pro_status = ttk.Label(pro_box, text="接口状态：未检测", foreground="#666666", font=("微软雅黑", 8))
+        self.lbl_pro_status.pack(anchor=tk.W, pady=(8, 0))
+
+        btn = ttk.Frame(self.tab_agent)
+        btn.pack(fill=tk.X)
+        ttk.Button(btn, text="💾 保存所有配置并生效", command=self.save_ui_to_config).pack(side=tk.RIGHT)
+        ttk.Button(btn, text="🔄 刷新接口状态", command=self.refresh_proactive_status).pack(side=tk.RIGHT, padx=6)
+
+    # 6. TAB: Test Sandbox
     def build_tab_test(self):
         ttk.Label(self.tab_test, text="🧪 模拟微信好友提问，测试当前 AI 引擎与 Prompt 的真实回复质量:", font=("微软雅黑", 9, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
@@ -502,6 +797,37 @@ class WeChatBotGUI(tk.Tk):
         for b in c.get("blacklist", []):
             self.listbox_bl.insert(tk.END, b)
 
+        # 通讯录
+        self._refresh_contacts_tree()
+
+        # Agent 大脑
+        ag = c.get("agent") or {}
+        self.var_agent_enabled.set(bool(ag.get("enabled", True)))
+        self.ent_agent_url.delete(0, tk.END)
+        self.ent_agent_url.insert(0, ag.get("url") or "http://127.0.0.1:44708/a2a")
+        self.ent_agent_prefix.delete(0, tk.END)
+        self.ent_agent_prefix.insert(0, ag.get("context_prefix") or "wx-")
+        self.spin_agent_timeout.set(ag.get("timeout_seconds") or 180)
+        self.spin_agent_defer.set(ag.get("max_defer_seconds") or 900)
+        self.txt_agent_fallback.delete("1.0", tk.END)
+        self.txt_agent_fallback.insert(
+            tk.END,
+            "\n".join(ag.get("fallback_replies") or ["嘿嘿，我这会儿有点懵，等下再聊~"]),
+        )
+
+        # 主动发送
+        pc = c.get("proactive_send") or {}
+        self.var_pro_enabled.set(bool(pc.get("enabled", False)))
+        self.var_pro_wl_only.set(bool(pc.get("whitelist_only", True)))
+        self.var_pro_confirm.set(bool(pc.get("require_confirm", False)))
+        self.var_pro_search.set(bool(pc.get("allow_search", True)))
+        self.ent_pro_host.delete(0, tk.END)
+        self.ent_pro_host.insert(0, pc.get("host") or "127.0.0.1")
+        self.spin_pro_port.set(pc.get("port") or 8765)
+        self.spin_pro_hour.set(pc.get("max_per_hour") or 3)
+        self.spin_pro_day.set(pc.get("max_per_day") or 20)
+        self._safe_after(800, self.refresh_proactive_status)
+
     def save_ui_to_config(self, show_msg=True):
         self.config_data["ai_engine"] = self.var_engine.get()
         self.config_data["openai_api"] = {
@@ -527,6 +853,16 @@ class WeChatBotGUI(tk.Tk):
         self.config_data["whitelist_mode"] = self.var_wl_mode.get()
         self.config_data["whitelist"] = list(self.listbox_wl.get(0, tk.END))
         self.config_data["blacklist"] = list(self.listbox_bl.get(0, tk.END))
+        self.config_data["contacts"] = self._contacts_from_tree_source()
+
+        # Agent 大脑：保留配置里其它未在界面暴露的键（card_url / retries / context_map_file…）
+        agent_merged = dict(self.config_data.get("agent") or {})
+        agent_merged.update(self._agent_cfg_dict())
+        self.config_data["agent"] = agent_merged
+
+        proactive_merged = dict(self.config_data.get("proactive_send") or {})
+        proactive_merged.update(self._proactive_cfg_dict())
+        self.config_data["proactive_send"] = proactive_merged
 
         if self.save_config():
             if show_msg:
@@ -600,6 +936,221 @@ class WeChatBotGUI(tk.Tk):
                 self.save_config()
             self.listbox_bl.delete(idx)
 
+    # ------------------------------------------------------------------
+    # 通讯录映射
+    # ------------------------------------------------------------------
+    def _refresh_contacts_tree(self):
+        if not hasattr(self, "tree_contacts"):
+            return
+        for item in self.tree_contacts.get_children():
+            self.tree_contacts.delete(item)
+        rows = self._contacts_from_tree_source()
+        for c in rows:
+            self.tree_contacts.insert("", tk.END, values=(c.get("remark", ""), c.get("wxid", "")))
+        # 白名单页提示：通讯录里的人会自动并入白名单
+        if hasattr(self, "lbl_wl_derived"):
+            remarks = [c.get("remark", "") for c in rows if c.get("remark")]
+            if remarks:
+                shown = "、".join(remarks[:8])
+                more = f" 等 {len(remarks)} 人" if len(remarks) > 8 else ""
+                self.lbl_wl_derived.configure(
+                    text=f"📇 通讯录映射已自动并入白名单：{shown}{more}"
+                         f"（这里只列手填的；通讯录请在「📇 通讯录映射」页管理）")
+            else:
+                self.lbl_wl_derived.configure(text="📇 通讯录映射里的人会自动并入白名单（当前 0 人）")
+
+    def _contacts_from_tree_source(self):
+        out = []
+        for c in self.config_data.get("contacts") or []:
+            if isinstance(c, str):
+                c = {"remark": c}
+            if not isinstance(c, dict):
+                continue
+            remark = str(c.get("remark") or c.get("name") or c.get("wechat_id") or c.get("alias") or "").strip()
+            wxid = str(c.get("wxid") or c.get("wechat_id") or c.get("alias") or "").strip()
+            if not remark and wxid:
+                remark = wxid
+            if remark:
+                out.append({"remark": remark, "wxid": wxid})
+        return out
+
+    def on_contact_select(self, event=None):
+        sel = self.tree_contacts.selection()
+        if not sel:
+            return
+        vals = self.tree_contacts.item(sel[0], "values")
+        self.ent_ct_remark.delete(0, tk.END)
+        self.ent_ct_remark.insert(0, vals[0] if vals else "")
+        self.ent_ct_wxid.delete(0, tk.END)
+        self.ent_ct_wxid.insert(0, vals[1] if len(vals) > 1 else "")
+
+    def add_contact(self):
+        remark = self.ent_ct_remark.get().strip()
+        wxid = self.ent_ct_wxid.get().strip()
+        if not remark:
+            messagebox.showwarning("提示", "备注不能为空（就是微信里显示的那个名字）")
+            return
+        contacts = self._contacts_from_tree_source()
+        hit = None
+        for c in contacts:
+            if c["remark"] == remark or (wxid and c.get("wxid") == wxid):
+                hit = c
+                break
+        if hit:
+            hit["remark"] = remark
+            hit["wxid"] = wxid
+        else:
+            contacts.append({"remark": remark, "wxid": wxid})
+        self.config_data["contacts"] = contacts
+        self._refresh_contacts_tree()
+        self.save_config()
+
+    def del_contact(self):
+        sel = self.tree_contacts.selection()
+        if not sel:
+            return
+        vals = self.tree_contacts.item(sel[0], "values")
+        remark = vals[0] if vals else ""
+        self.config_data["contacts"] = [
+            c for c in self._contacts_from_tree_source() if c["remark"] != remark
+        ]
+        self._refresh_contacts_tree()
+        self.save_config()
+
+    def import_contacts_from_whitelist(self):
+        contacts = self._contacts_from_tree_source()
+        have = {c["remark"] for c in contacts}
+        added = 0
+        for name in self.config_data.get("whitelist") or []:
+            name = str(name).strip()
+            if name and name not in have:
+                contacts.append({"remark": name, "wxid": ""})
+                have.add(name)
+                added += 1
+        self.config_data["contacts"] = contacts
+        self._refresh_contacts_tree()
+        self.save_config()
+        messagebox.showinfo("导入完成", f"从白名单新增 {added} 条到通讯录。")
+
+    # ------------------------------------------------------------------
+    # Agent 大脑 / 主动发送
+    # ------------------------------------------------------------------
+    def _agent_cfg_dict(self):
+        fallbacks = [
+            ln.strip()
+            for ln in self.txt_agent_fallback.get("1.0", tk.END).splitlines()
+            if ln.strip()
+        ]
+        try:
+            timeout_v = int(float(self.spin_agent_timeout.get()))
+        except Exception:
+            timeout_v = 180
+        try:
+            defer_v = int(float(self.spin_agent_defer.get()))
+        except Exception:
+            defer_v = 900
+        return {
+            "enabled": bool(self.var_agent_enabled.get()),
+            "url": self.ent_agent_url.get().strip() or "http://127.0.0.1:44708/a2a",
+            "context_prefix": self.ent_agent_prefix.get().strip() or "wx-",
+            "timeout_seconds": timeout_v,
+            "max_defer_seconds": defer_v,
+            "fallback_replies": fallbacks or ["嘿嘿，我这会儿有点懵，等下再聊~"],
+        }
+
+    def _proactive_cfg_dict(self):
+        def _int(spin, default):
+            try:
+                return int(float(spin.get()))
+            except Exception:
+                return default
+
+        return {
+            "enabled": bool(self.var_pro_enabled.get()),
+            "host": self.ent_pro_host.get().strip() or "127.0.0.1",
+            "port": _int(self.spin_pro_port, 8765),
+            "whitelist_only": bool(self.var_pro_wl_only.get()),
+            "max_per_hour": _int(self.spin_pro_hour, 3),
+            "max_per_day": _int(self.spin_pro_day, 20),
+            "require_confirm": bool(self.var_pro_confirm.get()),
+            "allow_search": bool(self.var_pro_search.get()),
+        }
+
+    def test_agent_connection(self):
+        cfg = dict(self.config_data)
+        cfg["agent"] = self._agent_cfg_dict()
+
+        def _work():
+            try:
+                if WORKSPACE_DIR not in sys.path:
+                    sys.path.insert(0, WORKSPACE_DIR)
+                from agent_client import AgentClient
+                cli = AgentClient(cfg)
+                ok = cli.is_available(timeout=3.0)
+                if ok:
+                    msg = f"✅ Agent 在线\n{cli.url}"
+                else:
+                    msg = f"❌ 连不上 Agent\n{cli.url}\n\n请确认 DSH 的 A2A 服务已开启。"
+            except Exception as exc:
+                msg = f"❌ 测试失败：{exc}"
+            self._ui_call(lambda: messagebox.showinfo("Agent 连接测试", msg))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _api_base(self):
+        pc = self._proactive_cfg_dict()
+        return f"http://{pc['host']}:{pc['port']}"
+
+    def refresh_proactive_status(self):
+        base = self._api_base()
+
+        def _work():
+            try:
+                with urllib.request.urlopen(base + "/status", timeout=2) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                txt = (f"接口状态：✅ 在线  {base}   "
+                       f"本小时 {data.get('sent_last_hour')}/{data.get('max_per_hour')}   "
+                       f"今日 {data.get('sent_today')}/{data.get('max_per_day')}   "
+                       f"待确认 {data.get('pending_confirm')}")
+                color = "#1e8e3e"
+            except Exception:
+                txt = f"接口状态：⚪ 未启动（{base}）。勾选「启用主动发送接口」并点保存，再重启服务即可。"
+                color = "#666666"
+            self._ui_call(lambda: self.lbl_pro_status.configure(text=txt, foreground=color))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def send_proactive_test(self):
+        target = self.ent_pro_test_target.get().strip()
+        text = self.ent_pro_test_text.get().strip()
+        if not target or not text:
+            messagebox.showwarning("提示", "请填写「发给」和「内容」")
+            return
+        base = self._api_base()
+        url = base + "/send?" + urllib.parse.urlencode({"target": target, "text": text})
+
+        def _work():
+            try:
+                req = urllib.request.Request(url, data=b"", method="POST")
+                with urllib.request.urlopen(req, timeout=180) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                if data.get("ok"):
+                    msg = "✅ 已发送"
+                else:
+                    msg = f"❌ 被拒绝：{data.get('code')}\n{data.get('detail') or ''}"
+            except urllib.error.HTTPError as e:
+                try:
+                    data = json.loads(e.read().decode("utf-8"))
+                    msg = f"❌ 被拒绝：{data.get('code')}\n{data.get('detail') or ''}"
+                except Exception:
+                    msg = f"❌ HTTP {e.code}"
+            except Exception as exc:
+                msg = f"❌ 请求失败：{exc}\n\n接口可能没启动，先保存配置并重启服务。"
+            self._ui_call(lambda: messagebox.showinfo("主动发送测试", msg))
+            self._safe_after(200, self.refresh_proactive_status)
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def run_sandbox_test(self):
         sender = self.ent_test_sender.get().strip() or "测试好友"
         msg = self.ent_test_msg.get().strip()
@@ -659,6 +1210,34 @@ class WeChatBotGUI(tk.Tk):
             self.txt_test_out.delete("1.0", tk.END)
             self.txt_test_out.insert(tk.END, f"❌ 请求大模型出错: {e}")
 
+    def _iter_candidate_procs(self):
+        """只枚举「可能是守护进程」的少量进程。
+
+        两级提速：
+        1) 旧代码对全系统逐个 `process_iter(attrs=['cmdline'])` 再 `proc.cmdline()` 取两遍
+           命令行 —— 实测单次 8.4s；改 `process_iter([pid,name])` 后 3.9s。
+        2) 现在用 `fast_process_names()`（EnumProcesses + QueryFullProcessImageNameW）
+           拿名字只要 0.04s，再按进程名粗筛（python / wechat_ai_bot / 微信ai），
+           通常只剩 1~5 个候选，整体降到 ~0.05s。
+        """
+        hints = ("python", "wechat_ai_bot", "微信ai")
+        names = fast_process_names()
+        if not names:
+            # 兜底：ctypes 枚举失败时退回 psutil
+            names = {}
+            for p in psutil.process_iter(["pid", "name"]):
+                try:
+                    names[p.info["pid"]] = p.info.get("name") or ""
+                except Exception:
+                    continue
+        for pid, name in names.items():
+            if not any(h in (name or "").lower() for h in hints):
+                continue
+            try:
+                yield psutil.Process(pid)
+            except Exception:
+                continue
+
     def is_target_bot_process(self, proc):
         try:
             cmdline = proc.cmdline() or []
@@ -701,13 +1280,12 @@ class WeChatBotGUI(tk.Tk):
             except Exception:
                 pass
                 
-        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        for proc in self._iter_candidate_procs():
             try:
-                if p.info['pid'] == my_pid:
+                if proc.pid == my_pid:
                     continue
-                proc = psutil.Process(p.info['pid'])
                 if self.is_target_bot_process(proc):
-                    return True, p.info['pid']
+                    return True, proc.pid
             except Exception:
                 pass
         return False, None
@@ -733,39 +1311,102 @@ class WeChatBotGUI(tk.Tk):
                 pass
                 
         # 2. Kill only dev bot processes (never touch stable)
-        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        for proc in self._iter_candidate_procs():
             try:
-                if p.info['pid'] == my_pid:
+                if proc.pid == my_pid:
                     continue
-                proc = psutil.Process(p.info['pid'])
                 if self.is_target_bot_process(proc):
                     proc.kill()
             except Exception:
                 pass
 
-    def start_bot(self):
+    def _set_bot_buttons(self, busy, action="start"):
+        """启停进行中时禁用按钮并改文案，避免重复点击 + 让用户看到反馈。"""
         try:
-            self.kill_bot_processes()
-            time.sleep(0.3)
+            if busy:
+                self.btn_start.configure(state="disabled")
+                self.btn_stop.configure(state="disabled")
+                if action == "start":
+                    self.btn_start.configure(text="⏳ 正在启动…")
+                else:
+                    self.btn_stop.configure(text="⏳ 正在停止…")
+            else:
+                self.btn_start.configure(state="normal", text="🚀 启动 AI 自动回复")
+                self.btn_stop.configure(state="normal", text="⏹️ 停止守护")
+        except Exception:
+            pass
 
+    def _run_bot_action(self, action):
+        """把「杀进程 / 拉进程」这种阻塞活丢到后台线程，主线程只轮询结果，彻底不卡界面。"""
+        if getattr(self, "_bot_action_running", False):
+            return
+        self._bot_action_running = True
+        self._bot_action_result = None
+        self._bot_action_kind = action
+        self._set_bot_buttons(True, action)
+        try:
+            self.lbl_bot_status.configure(
+                text=("⏳ AI 守护进程: 正在启动..." if action == "start"
+                      else "⏳ AI 守护进程: 正在停止..."),
+                foreground="#e67e22")
+        except Exception:
+            pass
+
+        def _work():
+            try:
+                self.kill_bot_processes()
+            except Exception:
+                pass
+            time.sleep(0.2)
+            if action != "start":
+                self._bot_action_result = (True, "已停止", "⏹️ 已停止所有微信 AI 自动回复进程。")
+                return
+            try:
+                SW_HIDE = 0
+                bot_exe = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.exe")
+                if not os.path.exists(bot_exe):
+                    bot_exe = os.path.join(WORKSPACE_DIR, "wechat_ai_bot.exe")
+                if os.path.exists(bot_exe):
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        0, "open", bot_exe, None, WORKSPACE_DIR, SW_HIDE)
+                else:
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        0, "open", sys.executable, f'"{BOT_SCRIPT}"', WORKSPACE_DIR, SW_HIDE)
+                time.sleep(0.5)
+                if ret > 32:
+                    self._bot_action_result = (
+                        True, "启动成功",
+                        "🚀 微信 AI 自动回复守护进程已在后台成功静默启动（无黑框模式）！")
+                else:
+                    self._bot_action_result = (
+                        False, "启动失败", f"启动守护进程失败，系统返回码: {ret}")
+            except Exception as e:
+                self._bot_action_result = (False, "启动失败", f"启动守护进程时出错: {e}")
+
+        threading.Thread(target=_work, daemon=True).start()
+        self._safe_after(120, self._poll_bot_action)
+
+    def _poll_bot_action(self):
+        if self._bot_action_result is None:
+            self._safe_after(120, self._poll_bot_action)
+            return
+        ok, title, msg = self._bot_action_result
+        self._bot_action_result = None
+        self._bot_action_running = False
+        self._set_bot_buttons(False)
+        if ok:
+            messagebox.showinfo(title, msg)
+        else:
+            messagebox.showerror(title, msg)
+
+    def start_bot(self):
+        if getattr(self, "_bot_action_running", False):
+            return
+        try:
             self.save_ui_to_config(show_msg=False)
-            
-            SW_HIDE = 0
-            bot_exe = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.exe")
-            if not os.path.exists(bot_exe):
-                bot_exe = os.path.join(WORKSPACE_DIR, "wechat_ai_bot.exe")
-            if os.path.exists(bot_exe):
-                ret = ctypes.windll.shell32.ShellExecuteW(0, "open", bot_exe, None, WORKSPACE_DIR, SW_HIDE)
-            else:
-                ret = ctypes.windll.shell32.ShellExecuteW(0, "open", sys.executable, f'"{BOT_SCRIPT}"', WORKSPACE_DIR, SW_HIDE)
-                
-            time.sleep(0.6)
-            if ret > 32:
-                messagebox.showinfo("启动成功", "🚀 微信 AI 自动回复守护进程已在后台成功静默启动（无黑框模式）！")
-            else:
-                messagebox.showerror("启动失败", f"启动守护进程失败，系统返回码: {ret}")
-        except Exception as e:
-            messagebox.showerror("启动失败", f"启动守护进程时出错: {e}")
+        except Exception:
+            pass
+        self._run_bot_action("start")
 
     def toggle_offscreen_wechat(self):
         try:
@@ -823,12 +1464,9 @@ class WeChatBotGUI(tk.Tk):
             messagebox.showerror("错误", f"切换离屏状态失败: {e}")
 
     def stop_bot(self):
-        try:
-            self.kill_bot_processes()
-            time.sleep(0.3)
-            messagebox.showinfo("已停止", "⏹️ 已停止所有微信 AI 自动回复进程。")
-        except Exception as e:
-            messagebox.showerror("错误", f"停止失败: {e}")
+        if getattr(self, "_bot_action_running", False):
+            return
+        self._run_bot_action("stop")
 
     def restart_bot(self):
         self.start_bot()
@@ -946,7 +1584,7 @@ class WeChatBotGUI(tk.Tk):
                 if not self.is_monitoring:
                     break
                 try:
-                    self.after(0, lambda wt=wx_text, wc=wx_color, bt=bot_text, bc=bot_color, nl=new_logs: self._update_ui_state(wt, wc, bt, bc, nl))
+                    self._ui_call(lambda wt=wx_text, wc=wx_color, bt=bot_text, bc=bot_color, nl=new_logs: self._update_ui_state(wt, wc, bt, bc, nl))
                 except Exception:
                     pass
                 time.sleep(1.5)
@@ -960,6 +1598,149 @@ class WeChatBotGUI(tk.Tk):
         if new_logs:
             self.txt_log.insert(tk.END, new_logs)
             self.txt_log.see(tk.END)
+
+    # ---------------- P3: 待确认消息弹窗 ----------------
+    def _load_pending_from_disk(self):
+        """读 pending_confirm.jsonl，只返回 status=pending 的记录。"""
+        items = []
+        if not os.path.exists(PENDING_FILE):
+            return items
+        try:
+            with open(PENDING_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("status", "pending") == "pending" and rec.get("id"):
+                        items.append(rec)
+        except Exception:
+            pass
+        items.sort(key=lambda x: x.get("created_ts") or 0)
+        return items
+
+    def _rewrite_pending_file(self, records):
+        """整体重写 jsonl（条数少，重写最稳）。"""
+        try:
+            tmp = PENDING_FILE + ".gui.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            os.replace(tmp, PENDING_FILE)
+            return True
+        except Exception as e:
+            messagebox.showerror("写入失败", f"更新待确认队列失败：\n{e}")
+            return False
+
+    def _drop_pending(self, pending_id):
+        records = [r for r in self._load_pending_from_disk() if r.get("id") != pending_id]
+        return self._rewrite_pending_file(records)
+
+    def _call_bot_http(self, path, payload):
+        """直接问正在跑的 bot 进程（它才是唯一能操作微信的进程）。"""
+        try:
+            cfg = self.load_config()
+            ps = cfg.get("proactive_send") or {}
+            host = ps.get("host") or "127.0.0.1"
+            port = int(ps.get("port") or 8765)
+            url = f"http://{host}:{port}{path}"
+            r = requests.post(url, json=payload, timeout=20)
+            return r.status_code, r.json()
+        except Exception as e:
+            return None, {"ok": False, "code": "http_error", "detail": str(e)}
+
+    def poll_pending_confirm(self):
+        """每 2 秒轮询一次待确认队列，有新消息就弹窗。"""
+        if not self.is_monitoring:
+            return
+        try:
+            items = self._load_pending_from_disk()
+            if items:
+                self._show_confirm_dialog(items)
+        except Exception:
+            pass
+        try:
+            self._safe_after(2000, self.poll_pending_confirm)
+        except Exception:
+            pass
+
+    def _show_confirm_dialog(self, items):
+        """一次只弹一条，避免刷屏；处理完自然轮询到下一批。"""
+        if getattr(self, "_confirm_dialog_open", False):
+            return
+        rec = items[0]
+        self._confirm_dialog_open = True
+
+        win = tk.Toplevel(self)
+        win.title("📨 待确认的主动消息")
+        win.geometry("520x320")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(win, text=f"收件人：{rec.get('target','')}", font=("微软雅黑", 11, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        ttk.Label(win, text="内容：", font=("微软雅黑", 9)).pack(anchor="w", padx=16)
+
+        txt = tk.Text(win, height=6, wrap=tk.WORD, font=("微软雅黑", 10))
+        txt.pack(fill=tk.BOTH, expand=True, padx=16, pady=4)
+        txt.insert("1.0", rec.get("text", ""))
+        txt.configure(state=tk.DISABLED)
+
+        ttk.Label(
+            win,
+            text=f"来源：{rec.get('source','api')}    排队：{len(items)} 条",
+            font=("微软雅黑", 8), foreground="#666666",
+        ).pack(anchor="w", padx=16)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=16, pady=12)
+
+        def _close():
+            self._confirm_dialog_open = False
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        def _do_send():
+            code, body = self._call_bot_http("/confirm", {"id": rec.get("id")})
+            if body.get("ok"):
+                self.txt_log.insert(tk.END, f"\n✅ [待确认] 已发送给【{rec.get('target')}】: {rec.get('text')}\n")
+                self.txt_log.see(tk.END)
+                _close()
+            else:
+                # bot 没在跑 / 被护栏拦下 —— 提示但不清队列
+                messagebox.showwarning(
+                    "没能发送",
+                    f"{body.get('detail') or body.get('code')}\n\n"
+                    "（如果 bot 没在运行，请先点「启动 AI 自动回复」再确认）",
+                )
+
+        def _do_skip():
+            code, body = self._call_bot_http("/reject", {"id": rec.get("id"), "reason": "gui"})
+            if not body.get("ok"):
+                self._drop_pending(rec.get("id"))
+            self.txt_log.insert(tk.END, f"\n🚫 [待确认] 已跳过发给【{rec.get('target')}】的消息\n")
+            self.txt_log.see(tk.END)
+            _close()
+
+        ttk.Button(btns, text="✅ 发送", command=_do_send).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="🚫 跳过", command=_do_skip).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="稍后再说", command=_close).pack(side=tk.RIGHT, padx=4)
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win.update_idletasks()
+        # 居中到主窗口
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+            win.geometry(f"+{max(x,0)}+{max(y,0)}")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app = WeChatBotGUI()

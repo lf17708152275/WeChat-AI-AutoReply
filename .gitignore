@@ -39,6 +39,8 @@ MANIFEST
 wechat_config_dev.json
 wechat_config.json
 wechat_convo_map.json
+wechat_agent_contexts.json
+pending_confirm.jsonl
 *.pid
 *.log
 *.tmp
@@ -58,3 +60,17 @@ Thumbs.db
 
 # Local notes & documentation
 口述文案*.md
+
+# One-off probe scripts & screenshots (development artifacts)
+_probe*.py
+_probe*.log
+_start_gui.py
+_launch_gui.py
+_restart_wx.py
+_patch_gui_test.py
+_fix_gui_test.py
+_shrink_roadmap.py
+_*.png
+
+# Local python packages installed via pip --target
+.pylibs/
