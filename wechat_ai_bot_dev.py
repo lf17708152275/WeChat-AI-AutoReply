@@ -2447,7 +2447,10 @@ def _linux_send_reply(hwnd, rect, layout, target, final_reply):
       - 没有 GetForegroundWindow 的强校验，改用 X11 焦点查询（lx.activate 返回）
       - PostMessage 换成 XTest（会移动光标）
       - 验收判据复用同一套 verify_diff_bubble_success（纯图像处理，平台无关）
+      - 离屏隐藏模式（XComposite）下不抬窗/不点鼠标：屏幕坐标上没有窗口，
+        只把键盘焦点直接给它，Ctrl+V / Enter 照样进输入框（实测可用）
     """
+    hidden = bool(lx and lx.is_hidden(hwnd))
     # --- 发送前核验：顶栏必须是目标会话，绝不盲发 ---
     img_now, cur_rect, _ = grab_wechat_window(hwnd)
     if img_now is None:
@@ -2459,7 +2462,15 @@ def _linux_send_reply(hwnd, rect, layout, target, final_reply):
     _, _, res_now, cur_title = _scan_window(hwnd)
     if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
         log(f"\u26a0\ufe0f [发送前纠偏] 当前顶栏【{cur_title or '未知'}】不是【{target}】，先切过去")
-        if not _linux_search_and_open(hwnd, target):
+        if hidden:
+            log("\U0001f5a5\ufe0f [离屏] 切换会话需要鼠标，临时召回微信窗口（切完立刻重新隐藏）")
+            lx.show_window(hwnd)
+            time.sleep(0.30)
+        switched = _linux_search_and_open(hwnd, target)
+        if hidden:
+            lx.hide_window(hwnd)
+            time.sleep(0.30)
+        if not switched:
             log(f"\U0001f6ab [发送中止] 无法锁定会话【{target}】")
             return False
         time.sleep(0.40)
@@ -2487,26 +2498,58 @@ def _linux_send_reply(hwnd, rect, layout, target, final_reply):
         img_pre, _, _ = grab_wechat_window(hwnd)
 
         # 击键前必须真的拿到键盘焦点，否则按键会串到别的窗口
-        if not activate_wechat(hwnd):
-            log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 微信没拿到键盘焦点，坚决终止按键防串窗")
-            time.sleep(0.15)
-            continue
+        if hidden:
+            if not lx.focus_window(hwnd):
+                log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 离屏模式下无法把键盘焦点给微信，终止击键")
+                time.sleep(0.15)
+                continue
+        else:
+            if not activate_wechat(hwnd):
+                log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 微信没拿到键盘焦点，坚决终止按键防串窗")
+                time.sleep(0.15)
+                continue
 
-        # 点输入框（几何中心，避开底部图标栏与顶部分割线）
-        input_safe_x = int(0.55 * cur_W)
-        input_safe_y = int(cur_H - cur_layout["input_h"] * 0.55)
-        post_click_client_point(hwnd, input_safe_x, input_safe_y)
-        time.sleep(0.10)
+            # 点输入框（几何中心，避开底部图标栏与顶部分割线）
+            input_safe_x = int(0.55 * cur_W)
+            input_safe_y = int(cur_H - cur_layout["input_h"] * 0.55)
+            post_click_client_point(hwnd, input_safe_x, input_safe_y)
+            time.sleep(0.10)
 
-        if not activate_wechat(hwnd):
-            log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 点击后焦点脱失，终止击键")
-            continue
+            if not activate_wechat(hwnd):
+                log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 点击后焦点脱失，终止击键")
+                continue
 
         _key_combo(0x56)                 # Ctrl+V
         time.sleep(0.18)
         _key_combo(0x0D, ctrl=False)     # Enter 发送
-        time.sleep(0.55)
 
+        if hidden:
+            # 离屏窗口的渲染会被 Chromium 降帧，气泡出现可能晚 1~2 秒；
+            # 这里多轮轮询，而且 Enter 已经发出就绝不重试（否则会给对方发两遍）
+            verdict = False
+            deadline = time.time() + 3.2
+            while time.time() < deadline:
+                time.sleep(0.45)
+                img_post, _, _ = grab_wechat_window(hwnd)
+                v = verify_diff_bubble_success(img_pre, img_post, cur_layout)
+                if v is True:
+                    verdict = True
+                    break
+                if v == "UNCERTAIN":
+                    verdict = "UNCERTAIN"
+                    break
+            if verdict is True:
+                send_success = True
+                break
+            if verdict == "UNCERTAIN":
+                log(f"\u26a0\ufe0f [离屏发送] 画面无法比对（可能被渲染节流），按已发送处理，避免重复")
+            else:
+                log(f"\u26a0\ufe0f [离屏发送] 3.2 秒内未检测到气泡增量，按已发送处理（不重发，避免重复消息）")
+            send_success = True
+            send_unverified = True
+            break
+
+        time.sleep(0.55)
         img_post, _, _ = grab_wechat_window(hwnd)
         verdict = verify_diff_bubble_success(img_pre, img_post, cur_layout)
         if verdict is True:
@@ -2945,12 +2988,21 @@ def scan_and_reply_wechat(hwnd):
             cand_y, cand_target = valid_candidates[0]
             LAST_CLICKED_CANDIDATE_TIME[cand_target] = now_ts
             log(f"\n🔔 [当前已回完·极速切入] 发现白名单好友【{cand_target}】未读红点，正在锁定切入...")
+            hidden_mode = bool(lx and lx.is_hidden(hwnd))
+            if hidden_mode:
+                # 离屏隐藏时屏幕坐标上没有窗口，XTest 鼠标点不到它：临时召回再点
+                log("🖥️ [离屏] 需要切入新会话，临时召回微信窗口（点完立刻重新隐藏）")
+                lx.show_window(hwnd)
+                time.sleep(0.25)
             activate_wechat(hwnd)
             
             # 点击左侧联系人项目中心位置 (sidebar_w + 0.45*(chat_start_x - sidebar_w), cand_y)
             click_x = int(layout["sidebar_w"] + 0.45 * (layout["chat_start_x"] - layout["sidebar_w"]))
             post_click_client_point(hwnd, click_x, int(cand_y))
             time.sleep(0.35) # 充分等待 Qt5 引擎将右侧所有新消息气泡 100% 渲染绘制完成
+            if hidden_mode:
+                lx.hide_window(hwnd)
+                time.sleep(0.20)
             
             # 强制重置像素哨兵哈希，确保切入后下个周期 100% 触发全量 OCR 读取
             LAST_CHAT_HASH = None

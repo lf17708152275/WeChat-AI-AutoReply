@@ -352,13 +352,22 @@ python 联调脚本_真实Agent.py     # 提交 -> 后台决策 -> 取回 -> 发
 
 ## 🐧 跨平台说明
 
-当前版本仅支持 **Windows**（底层依赖 `user32` / `gdi32` 抓图与消息投递）。
+Windows 与 Linux/X11 都已支持，平台差异全部收敛在 `wechat_linux_io.py`（Windows 分支逐字未改）：
 
-Linux 版微信的移植已完成可行性调研，结论是**可行，但输入层必须从"鼠标点击"改成"纯键盘驱动"**
-（XTest 合成点击不被 Linux 版微信接受，但键盘事件正常）。完整实测数据、平台层设计、
-依赖清单、踩坑记录与验收标准见 **[Linux移植规划.md](Linux移植规划.md)**。
+| 能力 | Windows | Linux / X11 |
+|---|---|---|
+| 抓图 | `PrintWindow`（窗口被挡也能抓） | `XGetImage` 抓 root 再裁剪；离屏时走 XComposite pixmap |
+| 点击 | `PostMessage` 后台点击 | XTest（会移动真实光标；离屏模式下不用鼠标） |
+| 键盘 | `SendInput` | XTest + 剪贴板粘贴（fcitx 会吞逐键字符） |
+| 隐藏微信 | 窗口移到 `(-3000, -3000)` | XComposite 离屏重定向 |
 
-> 状态：已调研，未开工。
+**👻 隐藏微信至离屏（Linux）**：GUI 顶栏按钮。开启后微信从桌面消失、不再抢焦点，
+bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）；需要切换会话时会临时召回窗口，
+切完自动藏回去。依赖 X 服务器的 Composite 扩展（xrdp 的 Xorg、Xvfb 都自带），
+不支持时会明确报错而不是静默失败。窗口几何记在 `wechat_config_dev.json` 的 `saved_window_rect`。
+
+Linux 依赖安装（无 pip 环境的手动装法）、`DISPLAY` / `XAUTHORITY` 设置、七套回归测试的跑法，
+见 **[Linux移植规划.md](Linux移植规划.md)** 与本文档「🧪 回归测试」一节。
 
 ---
 

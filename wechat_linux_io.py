@@ -270,11 +270,124 @@ def occlusion_ratio(wid, rect=None, threshold=0.02):
     return min(1.0, total)
 
 
+# ----------------------------------------------------------------------------
+# 离屏隐藏（XComposite）：把微信窗口转到 off-screen storage
+# ----------------------------------------------------------------------------
+# 原理：XComposite 的 RedirectAutomatic 会把窗口内容改画到服务器端的离屏 pixmap。
+# 本机没有独立的合成器（_NET_WM_CM_S0 无人持有），所以一旦 redirect：
+#   - 桌面上就看不见这个窗口了（用户可正常用电脑，不会被弹窗/抬窗打扰）
+#   - 但窗口仍 mapped，XGetImage 抓它的 pixmap 依然能拿到 100% 真实画面
+#   - 键盘焦点可以用 XSetInputFocus 直接给窗口，Ctrl+V/Enter 照常生效
+# 要用鼠标点窗口内坐标时（切会话/搜索）必须先 show_window 再操作，因为
+# 隐藏时屏幕坐标上根本没有这个窗口，XTest 的鼠标事件会打到别人身上。
+_HIDDEN = set()
+_COMPOSITE_OK = None
+
+
+def _composite_ok():
+    global _COMPOSITE_OK
+    if _COMPOSITE_OK is None:
+        try:
+            _COMPOSITE_OK = dpy().query_extension("Composite") is not None
+        except Exception:
+            _COMPOSITE_OK = False
+    return bool(_COMPOSITE_OK)
+
+
+def is_hidden(wid):
+    return int(wid) in _HIDDEN
+
+
+def hide_window(wid):
+    """把窗口转入离屏（桌面上彻底看不见），返回是否成功。"""
+    wid = int(wid)
+    if wid in _HIDDEN:
+        return True
+    if not _composite_ok():
+        return False
+    try:
+        from Xlib.ext import composite
+        with _LOCK:
+            d = dpy()
+            w = d.create_resource_object("window", wid)
+            w.composite_redirect_window(composite.RedirectAutomatic)
+            d.sync()
+        _HIDDEN.add(wid)
+        return True
+    except Exception:
+        return False
+
+
+def show_window(wid):
+    """把离屏窗口召回桌面。"""
+    wid = int(wid)
+    if wid not in _HIDDEN:
+        return True
+    try:
+        from Xlib.ext import composite
+        with _LOCK:
+            d = dpy()
+            w = d.create_resource_object("window", wid)
+            w.composite_unredirect_window(composite.RedirectAutomatic)
+            d.sync()
+        _HIDDEN.discard(wid)
+        return True
+    except Exception:
+        return False
+
+
+def _grab_hidden(wid):
+    """离屏窗口抓图：直接用 Composite pixmap（不受遮挡/屏幕位置影响）。"""
+    from Xlib.ext import composite
+    with _LOCK:
+        d = dpy()
+        w = d.create_resource_object("window", int(wid))
+        g = w.get_geometry()
+        if g.width <= 1 or g.height <= 1:
+            return None
+        pix = w.composite_name_window_pixmap()
+        raw = pix.get_image(0, 0, g.width, g.height, X.ZPixmap, 0xffffffff).data
+    if len(raw) != g.width * g.height * 4:
+        return None
+    # xrdp 下 ZPixmap depth24 的实际字节序是 BGRX
+    return Image.frombytes("RGB", (g.width, g.height), raw, "raw", "BGRX")
+
+
+def set_window_geometry(wid, x, y, width, height):
+    """把窗口移动/缩放到指定几何（离屏召回时用）。"""
+    try:
+        with _LOCK:
+            d = dpy()
+            w = d.create_resource_object("window", int(wid))
+            w.configure(x=int(x), y=int(y), width=int(width), height=int(height))
+            d.sync()
+        return True
+    except Exception:
+        return False
+
+
+def focus_window(wid):
+    """不抬窗、不抢 Z-Order，直接把键盘焦点给窗口（离屏发送用）。"""
+    try:
+        with _LOCK:
+            d = dpy()
+            w = d.create_resource_object("window", int(wid))
+            w.set_input_focus(X.RevertToParent, X.CurrentTime)
+            d.sync()
+        return True
+    except Exception:
+        return False
+
+
 def grab_window(wid, retries=2):
     """返回 (PIL.Image, Rect, scale)。scale 恒为 1.0（Linux 下图像即物理像素）。"""
     d = dpy()
     scr = d.screen()
     wid = int(wid)
+    if is_hidden(wid):
+        # 离屏模式：看不见但抓得到，完全不碰窗口层级/焦点
+        img = _grab_hidden(wid)
+        return img, window_rect(wid), 1.0
     if not is_viewable(wid):
         ensure_visible(wid)
 
@@ -373,7 +486,12 @@ def _send_net_active(w):
 
 
 def activate(wid, timeout=0.8):
-    """把微信顶到前台并拿到键盘焦点。返回是否成功。"""
+    """把微信顶到前台并拿到键盘焦点。返回是否成功。
+
+    离屏隐藏时不能抬窗/映射（会把窗口拉回桌面），只把键盘焦点给它。
+    """
+    if is_hidden(wid):
+        return focus_window(wid)
     d = dpy()
     wid = int(wid)
     w = d.create_resource_object("window", wid)

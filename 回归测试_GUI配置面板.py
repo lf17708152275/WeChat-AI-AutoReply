@@ -101,6 +101,8 @@ check("端口默认", str(app.spin_pro_port.get()), "8765")
 print("\n=== 3b. A2A 关系路由 ===")
 check("通讯录表格列（端点已移出，只留会话）",
       tuple(app.tree_contacts["columns"]), ("remark", "wxid", "relation", "session"))
+check("通讯录关系下拉只读（不能手打，只能选路由表里的关系）",
+      str(app.cbo_ct_relation.cget("state")), "readonly")
 route_rows = [app.tree_routes.item(i, "values") for i in app.tree_routes.get_children()]
 check("关系路由条数与配置一致", len(route_rows), len(SEED_RELATION_URLS))
 app.ent_route_relation.set("测试关系")
@@ -126,6 +128,70 @@ route_rows = [app.tree_routes.item(i, "values") for i in app.tree_routes.get_chi
 check_true("删除关系后从路由表消失", all(r[0] != "测试关系" for r in route_rows))
 check_true("通讯录关系下拉已联动（移除测试关系）",
            "测试关系" not in list(app.cbo_ct_relation.cget("values")))
+
+print("\n=== 3b-2. Linux 离屏隐藏按钮（假后端，不碰真窗口） ===")
+
+
+class _FakeRect:
+    def __init__(self, left, top, width, height):
+        self.left, self.top, self.width, self.height = left, top, width, height
+
+
+class _FakeLx:
+    def __init__(self):
+        self.hidden = False
+        self.hide_calls = 0
+        self.show_calls = 0
+        self.geom_calls = []
+
+    def is_hidden(self, wid):
+        return self.hidden
+
+    def hide_window(self, wid):
+        self.hidden = True
+        self.hide_calls += 1
+        return True
+
+    def show_window(self, wid):
+        self.hidden = False
+        self.show_calls += 1
+
+    def window_rect(self, wid):
+        return _FakeRect(80, 120, 1000, 700)
+
+    def set_window_geometry(self, wid, x, y, w, h):
+        self.geom_calls.append((x, y, w, h))
+
+
+_orig_lx = gui.lx
+_orig_hwnd = gui.get_wechat_hwnd
+_orig_info = gui.messagebox.showinfo
+_orig_err = gui.messagebox.showerror
+_fake_lx = _FakeLx()
+_offscreen_msgs = []
+gui.lx = _fake_lx
+gui.get_wechat_hwnd = lambda: (424242, 4)
+gui.messagebox.showinfo = lambda *a, **k: _offscreen_msgs.append(("info", a[0] if a else ""))
+gui.messagebox.showerror = lambda *a, **k: _offscreen_msgs.append(("error", a[0] if a else ""))
+try:
+    app.toggle_offscreen_wechat()
+    app.update()
+    check("离屏隐藏调用 hide_window", _fake_lx.hide_calls, 1)
+    check("按钮文案切到「召唤微信回桌面」",
+          "召唤" in str(app.btn_hide_wx.cget("text")), True)
+    check("隐藏前记录了窗口几何", list(app.config_data.get("saved_window_rect") or [])[:2], [80, 120])
+    app.toggle_offscreen_wechat()
+    app.update()
+    check("再次点击召回（show_window）", _fake_lx.show_calls, 1)
+    check("召回时把窗口摆回记录的几何", _fake_lx.geom_calls, [(80, 120, 1000, 700)])
+    check("按钮文案恢复「隐藏微信至离屏」",
+          "隐藏" in str(app.btn_hide_wx.cget("text")), True)
+    check_true("两次切换都有提示弹窗", len(_offscreen_msgs) == 2)
+finally:
+    gui.lx = _orig_lx
+    gui.get_wechat_hwnd = _orig_hwnd
+    gui.messagebox.showinfo = _orig_info
+    gui.messagebox.showerror = _orig_err
 
 print("\n=== 3c. 底部实时日志监听 ===")
 check_true("日志面板在主区域分栏内（拖不出来也挤不掉）",

@@ -927,7 +927,7 @@ class WeChatBotGUI(tk.Tk):
         row3 = ttk.Frame(right)
         row3.pack(fill=tk.X, pady=3)
         ttk.Label(row3, text="关系:", width=8).pack(side=tk.LEFT)
-        self.cbo_ct_relation = ttk.Combobox(row3, width=22, state="normal",
+        self.cbo_ct_relation = ttk.Combobox(row3, width=22, state="readonly",
                                             values=self._relation_choices())
         self.cbo_ct_relation.pack(side=tk.LEFT)
         ttk.Label(right, text="（决定走哪个 A2A 关系端点，可自己填新关系名）",
@@ -1831,6 +1831,8 @@ class WeChatBotGUI(tk.Tk):
         self._run_bot_action("start")
 
     def toggle_offscreen_wechat(self):
+        if IS_LINUX:
+            return self._toggle_offscreen_wechat_linux()
         try:
             hwnd, _ = get_wechat_hwnd()
             if not hwnd:
@@ -1882,6 +1884,54 @@ class WeChatBotGUI(tk.Tk):
                 user32.SetWindowPos(hwnd, 0, -3000, -3000, w, h, 0x0040 | 0x0010)
                 self.btn_hide_wx.configure(text="🖥️ 召唤微信回桌面")
                 messagebox.showinfo("已隐藏", "👻 微信已成功记录当前位置大小，并移入离屏隐形空间！\n\n您的桌面已彻底隐形不占空间，AI 守护进程依然在后台全速秒回。\n随时可点击此按钮召回微信。")
+        except Exception as e:
+            messagebox.showerror("错误", f"切换离屏状态失败: {e}")
+
+    def _toggle_offscreen_wechat_linux(self):
+        """Linux：XComposite 离屏重定向——桌面看不见，但 bot 抓图/OCR/发消息照旧。
+
+        与 Windows 版 -3000,-3000 的区别：X11 下窗口移到屏幕外会抓不到画面，
+        所以用 Composite 把窗口内容改画到服务器端 offscreen pixmap；窗口仍在
+        mapped 状态，键盘焦点可以直接给它，因此发送走"只给焦点、不抬窗"。
+        注意：这时用鼠标点窗口内坐标会打到别的窗口上，所以 bot 只在需要切换
+        会话时临时召回窗口，切完立刻重新隐藏。
+        """
+        try:
+            if lx is None:
+                messagebox.showerror("错误", "wechat_linux_io 不可用，无法使用离屏隐藏。")
+                return
+            hwnd, _ = get_wechat_hwnd()
+            if not hwnd:
+                messagebox.showwarning("提示", "未检测到微信窗口！请先打开微信。")
+                return
+            if lx.is_hidden(hwnd):
+                lx.show_window(hwnd)
+                saved = self.config_data.get("saved_window_rect") or [100, 100, 1100, 750]
+                try:
+                    x, y, w, h = [int(v) for v in list(saved)[:4]]
+                except Exception:
+                    x, y, w, h = 100, 100, 1100, 750
+                sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+                if not (0 <= x <= max(0, sw - 200) and 0 <= y <= max(0, sh - 200)):
+                    x = max(50, (sw - w) // 2)
+                    y = max(50, (sh - h) // 2)
+                lx.set_window_geometry(hwnd, x, y, w, h)
+                self.btn_hide_wx.configure(text="👻 隐藏微信至离屏")
+                messagebox.showinfo("已召回", f"🖥️ 微信已回到桌面：({x}, {y})，{w}×{h}")
+            else:
+                rect = lx.window_rect(hwnd)
+                if rect.width >= 400 and rect.height >= 300:
+                    self.config_data["saved_window_rect"] = [rect.left, rect.top, rect.width, rect.height]
+                    self.save_config()
+                if not lx.hide_window(hwnd):
+                    messagebox.showerror("错误", "当前 X 服务器不支持 Composite 离屏重定向，无法隐藏微信。")
+                    return
+                self.btn_hide_wx.configure(text="🖥️ 召唤微信回桌面")
+                messagebox.showinfo(
+                    "已隐藏",
+                    "👻 微信已转入离屏隐藏（桌面不再显示，也不抢焦点）。\n\n"
+                    "AI 守护进程仍可抓图/OCR/发消息；\n需要切换会话时会短暂召回一下，切完自动藏回。\n"
+                    "点同一个按钮可随时召回微信。")
         except Exception as e:
             messagebox.showerror("错误", f"切换离屏状态失败: {e}")
 
