@@ -165,15 +165,15 @@ pc.logger = lambda m: None
 
 check("标准 JSON",
       pc._parse('{"action":"reply","text":"在的","urgency":"now","reason":"r"}'),
-      {"action": "reply", "text": "在的", "segments": ["在的"], "urgency": "now", "reason": "r"})
+      {"action": "reply", "text": "在的", "segments": ["在的"], "stickers": [], "urgency": "now", "reason": "r"})
 
 check("markdown 围栏包裹",
       pc._parse('```json\n{"action":"ignore","text":"","urgency":"now","reason":"广告"}\n```'),
-      {"action": "ignore", "text": "", "segments": [], "urgency": "now", "reason": "广告"})
+      {"action": "ignore", "text": "", "segments": [], "stickers": [], "urgency": "now", "reason": "广告"})
 
 check("前后夹带废话",
       pc._parse('好的，我判断如下：\n{"action":"reply","text":"来了","urgency":"soon","reason":"x"}\n以上。'),
-      {"action": "reply", "text": "来了", "segments": ["来了"], "urgency": "soon", "reason": "x"})
+      {"action": "reply", "text": "来了", "segments": ["来了"], "stickers": [], "urgency": "soon", "reason": "x"})
 
 check("缺 action 但有正文 → reply",
       pc._parse('{"text":"哈哈哈","urgency":"now"}')["action"], "reply")
@@ -624,6 +624,52 @@ except RuntimeError as exc:
     _detail = str(exc)
 check("失败任务的 status.message 会带进异常",
       "already owned by an active write handle" in _detail, True)
+
+
+# ===========================================================================
+print("=== 5.5 表情回复解析（DSH 表情插件）===")
+_sticker_url = "http://127.0.0.1:25675/x-nekowhale-stickers/s/4b1576f9a927.gif"
+_plain = agent_client.AgentClient.__new__(agent_client.AgentClient)
+
+# 1) 模型按契约把表情放进 sticker 字段
+_d1 = _plain._parse('{"action":"reply","segments":["刚摸鱼回来","歇会儿吧"],'
+                    '"sticker":"![摸鱼](%s)","urgency":"now","reason":"x"}' % _sticker_url)
+check("JSON 里 sticker 字段被解析出来", _d1.get("stickers"), [_sticker_url])
+check("表情不会混进正文", _d1.get("segments"), ["刚摸鱼回来", "歇会儿吧"])
+
+# 2) 表情 markdown 直接写在 segments 里也要能剥出来
+_d2 = _plain._parse('{"action":"reply","segments":["哈哈哈 ![笑](%s)"],"urgency":"now"}' % _sticker_url)
+check("正文里的表情 markdown 被剥离", _d2.get("segments"), ["哈哈哈"])
+check("剥离出来的图片进了 stickers", _d2.get("stickers"), [_sticker_url])
+
+# 3) 只发表情、不写字也算有效回复（不能走兜底话术）
+_d3 = _plain._parse('{"action":"reply","sticker":"![摸鱼](%s)","urgency":"now"}' % _sticker_url)
+check("只有表情没有正文也能成决策", _d3.get("stickers"), [_sticker_url])
+check("只有表情时正文为空", _d3.get("segments"), [])
+
+# 4) 模型忘记 JSON、直接回聊天文字 + 表情（实测出现过）也要救回来
+_d4 = _plain._parse("今天心情好，也要开心得像布丁一样晃起来。\n\n![布丁](%s)" % _sticker_url)
+check("纯文字回复会兜住成 reply", _d4.get("action"), "reply")
+check("纯文字里的表情被识别", _d4.get("stickers"), [_sticker_url])
+check("纯文字正文干净", _d4.get("segments"), ["今天心情好，也要开心得像布丁一样晃起来。"])
+
+# 5) 普通链接不能被误认成表情
+_d5 = _plain._parse('{"action":"reply","text":"看这个 https://example.com/x.png","urgency":"now"}')
+check("普通链接不会被当表情", _d5.get("stickers"), [])
+
+# 6) 决策层再兜一层：只放行表情插件路径 + 本机/局域网地址
+import wechat_ai_bot_dev as _wb
+check("决策层放行本机表情链接", _wb._decision_stickers({"stickers": [_sticker_url]}), [_sticker_url])
+check("决策层拦掉外站图片",
+      _wb._decision_stickers({"stickers": ["http://evil.example.com/x-nekowhale-stickers/s/a.gif"]}),
+      ["http://evil.example.com/x-nekowhale-stickers/s/a.gif"])
+check("下载器拒绝外站地址", _wb.download_sticker("http://evil.example.com/x-nekowhale-stickers/s/a.gif"), None)
+check("下载器能拿到表情文件（本机插件）",
+      bool(_wb.download_sticker(_sticker_url)), True)
+_dl = _wb.download_sticker(_sticker_url)
+if _dl:
+    import os as _os
+    _os.remove(_dl)
 
 
 # ===========================================================================

@@ -69,11 +69,42 @@ CONTRACT = """你是微信自动回复代理，代替账号主人回复好友消
 - urgency=now 立即发；soon 30-90 秒后发；later 3-15 分钟后发
 - segments/text 只写要发出去的话：不要加引号、不要加说明、不要带 [AI] 之类前缀、不要带序号
 - 不要用书面连接词（首先/其次/此外/总之）、不要列点、不要括号写动作、不要句末客套
+- 想斗图/发表情时：可以调用表情工具（sticker_search / sticker_send），把工具返回的那一行
+  markdown 图片原样放在 JSON 的 "sticker" 字段里（形如 "![摸鱼](http://127.0.0.1:25675/x-nekowhale-stickers/s/xxxx.gif)"）
+  · 一条回复最多 1 张表情，别每句都配图；图片链接不要混进 segments 正文
+  · 表情是锦上添花：对方在难过/说正事时不要发表情
+  · 注意：即使要发表情，也**只输出那一行 JSON**，绝对不要直接输出聊天文字或裸 markdown
 - 严禁透露自己是 AI 或机器人"""
 
 # 一次回复最多拆几条：太多会像刷屏，真人连发 1-3 条最自然，留 4 的余量
 MAX_SEGMENTS = 4
 SEGMENT_SPLIT_RE = re.compile(r"\s*\|\|\|\s*")
+
+# 表情包：DSH 表情插件吐出来的是 markdown 图片，bot 会下载后当图片消息发出去
+MAX_STICKERS = 2
+STICKER_MD_RE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)")
+STICKER_BARE_RE = re.compile(r"(https?://[^\s)\]\[]+/x-nekowhale-stickers/[^\s)\]\[]+)")
+
+
+def split_stickers(text):
+    """把一段文字里的表情 markdown / 裸贴纸链接剥出来。
+
+    返回 (清干净的文字, [贴纸 url...])。只认 http(s) 且带表情插件路径的链接，
+    避免把普通图片/链接当表情。
+    """
+    urls = []
+
+    def take(m):
+        url = m.group(1).strip()
+        if url not in urls:
+            urls.append(url)
+        return ""
+
+    cleaned = STICKER_MD_RE.sub(take, str(text or ""))
+    cleaned = STICKER_BARE_RE.sub(take, cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, urls
 
 
 def decision_segments(obj):
@@ -606,18 +637,61 @@ class AgentClient(object):
 
         obj = _first_json_object(text)
         if obj is None:
+            # 模型偶尔忘记 JSON：直接回了聊天文字（有时还顺手把表情 markdown 写在后面）。
+            # 这种输出比走固定兜底话术好得多，能救就救。
+            cleaned, found = split_stickers(text)
+            if not found:
+                return None
+            lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+            segments = [" ".join(lines)] if len(lines) > 1 else lines
+            segments = [seg.strip(" \"\u201c\u201d") for seg in segments if seg.strip(" \"\u201c\u201d")]
+            if segments or found:
+                return {
+                    "action": "reply",
+                    "text": "\n".join(segments),
+                    "segments": segments[:MAX_SEGMENTS],
+                    "stickers": found[:MAX_STICKERS],
+                    "urgency": "now",
+                    "reason": "plain_text_reply",
+                }
             return None
 
         action = str(obj.get("action") or "").strip().lower()
-        segments = decision_segments(obj)
+        raw_segments = decision_segments(obj)
+
+        # 表情：模型可能把 markdown 塞进 segments/text，也可能走独立字段
+        stickers = []
+        explicit = obj.get("sticker")
+        if explicit is None:
+            explicit = obj.get("stickers")
+        if isinstance(explicit, str):
+            explicit = [explicit]
+        if isinstance(explicit, list):
+            for item in explicit:
+                if isinstance(item, dict):
+                    item = item.get("url") or item.get("text") or ""
+                _clean, found = split_stickers(item)
+                for url in found:
+                    if url not in stickers:
+                        stickers.append(url)
+
+        segments = []
+        for seg in raw_segments:
+            cleaned, found = split_stickers(seg)
+            for url in found:
+                if url not in stickers:
+                    stickers.append(url)
+            if cleaned:
+                segments.append(cleaned)
+        stickers = stickers[:MAX_STICKERS]
         out_text = "\n".join(segments)
 
         if action not in ACTION_SET:
             # 模型忘了给 action：有正文就当 reply，没正文就当 ignore
             action = "reply" if segments else "ignore"
 
-        if action == "reply" and not segments:
-            # 说要回却没内容 —— 视为坏输出，走降级兜底
+        if action == "reply" and not segments and not stickers:
+            # 说要回却既没正文也没表情 —— 视为坏输出，走降级兜底
             return None
         urgency = str(obj.get("urgency") or "").strip().lower()
         if urgency not in URGENCY_SET:
@@ -628,6 +702,7 @@ class AgentClient(object):
             "action": action,
             "text": out_text,
             "segments": segments,
+            "stickers": stickers,
             "urgency": urgency,
             "reason": reason,
         }
@@ -641,6 +716,7 @@ class AgentClient(object):
             "action": "reply",
             "text": text,
             "segments": [text],
+            "stickers": [],
             "urgency": "now",
             "reason": "agent_unavailable",
         }

@@ -200,13 +200,14 @@ curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" 
 Agent 返回的契约（一行 JSON）：
 
 ```json
-{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "urgency": "now|soon|later", "reason": "一句话理由"}
+{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "sticker": "![摸鱼](http://127.0.0.1:25675/x-nekowhale-stickers/s/xxxx.gif)", "urgency": "now|soon|later", "reason": "一句话理由"}
 ```
 
 | 字段 | 含义 |
 | --- | --- |
 | `action` | `reply` 该回 / `ignore` 不用回 / `defer` 现在不合适 |
 | `segments` | 要**逐条连发**的消息数组（1–4 条，每条 5–30 字，像真人分条发）。只有一条时也可写 `"text": "..."`；老契约的 `text` 继续兼容，`text` 里用 `\|\|\|` 分隔也会被拆开 |
+| `sticker` | 可选，一张表情图片的 markdown（来自 DSH 表情插件，形如 `![摸鱼](http://127.0.0.1:25675/x-nekowhale-stickers/s/xxxx.gif)`）。bot 会下载后当图片消息发出；也可以只发表情不写字。写在 `segments` 里的表情 markdown 同样会被剥出来 |
 | `urgency` | `now` 立即 / `soon` 30–90 秒 / `later` 3–15 分钟（带 ±20% 抖动） |
 | `reason` | 一句话理由，只用于日志 |
 
@@ -216,6 +217,9 @@ Agent 返回的契约（一行 JSON）：
 | `ignore` | 不发，但记下签名防止重复处理 |
 | `defer` | 整组消息进延时队列，超过 `max_defer_seconds` 放弃 |
 
+- **表情包（表情来自 DSH 的表情插件）**：A2A 会话里的模型可以直接调用 `sticker_search` / `sticker_send`，
+  把工具返回的那行 markdown 放进 `sticker` 字段；bot 只放行本机/局域网表情插件的图片链接，
+  下载后走「复制图片 → Ctrl+V 贴图 → Enter 发送」，离屏隐藏模式下同样能发。一条回复最多 2 张，失败不重发。
 - **为什么分条**：DSH 单次回复有长度限制，长段落挤成一条既难看又容易被截断。让模型输出 `segments` 数组，bot 逐条发出去，阅读节奏跟真人连发一致。
 - 段间停顿可用 `segment_delay_min_seconds` / `segment_delay_span_seconds` 调（默认 0.45 / 0.9，另加 0–0.35 秒随机抖动）。
 - **Agent 不可用时**：记 ERROR 日志 + 发一条 `fallback_replies` 里的固定可爱回复，不会静默，也不会退回旧的直连模型。

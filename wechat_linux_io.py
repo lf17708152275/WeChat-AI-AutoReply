@@ -19,6 +19,7 @@ Linux（X11）后端：把 wechat_ai_bot_dev.py 里那 12 个 Win32 函数换成
 - 一次性 GTK 进程持有剪贴板时要等它退出（8s+），改成常驻守护后 0.2s。
 - 窗口会被用户/WM 拖动，任何点击前都必须重新取几何。
 """
+import json
 import os
 import re
 import subprocess
@@ -38,12 +39,15 @@ _DISPLAY = None
 
 CLIP_FILE = "/tmp/wx_bot_clip.txt"
 
+CLIP_IMAGE_FILE = "/tmp/wx_bot_clip_img.json"
 CLIPD_SNIPPET = r"""
-import os, sys, gi
+import os, sys, json, gi
 gi.require_version('Gtk','3.0')
-from gi.repository import Gtk, Gdk, GLib
+gi.require_version('GdkPixbuf','2.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
 path = sys.argv[1]
-state = {"last": None}
+img_path = sys.argv[2] if len(sys.argv) > 2 else None
+state = {"last": None, "img_nonce": None}
 cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
 
 def tick():
@@ -51,6 +55,20 @@ def tick():
     if os.getppid() == 1:
         Gtk.main_quit()
         return False
+    # 图片优先：微信里 Ctrl+V 贴图靠 image 目标
+    if img_path:
+        try:
+            with open(img_path, encoding="utf-8") as f:
+                req = json.load(f)
+            nonce = req.get("nonce")
+            if nonce != state["img_nonce"]:
+                state["img_nonce"] = nonce
+                pix = GdkPixbuf.Pixbuf.new_from_file(req["path"])
+                cb.set_image(pix)
+                cb.store()
+                return True
+        except Exception:
+            pass
     try:
         with open(path, encoding="utf-8") as f:
             txt = f.read()
@@ -701,7 +719,7 @@ def _ensure_clipd():
         with open(CLIP_FILE, "w", encoding="utf-8") as f:
             f.write("")
     _CLIPD = subprocess.Popen(
-        [sys.executable, "-c", CLIPD_SNIPPET, CLIP_FILE],
+        [sys.executable, "-c", CLIPD_SNIPPET, CLIP_FILE, CLIP_IMAGE_FILE],
         env=os.environ.copy(),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -716,6 +734,18 @@ def clipboard_copy(text):
         with open(CLIP_FILE, "w", encoding="utf-8") as f:
             f.write(str(text))
         time.sleep(0.22)     # 等守护进程轮询到变化并 set_text
+        return True
+    except Exception:
+        return False
+
+
+def clipboard_copy_image(path):
+    """把图片写系统剪贴板（GIF/PNG/JPG，微信里 Ctrl+V 可当图片粘贴）。"""
+    try:
+        _ensure_clipd()
+        with open(CLIP_IMAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"path": os.path.abspath(str(path)), "nonce": time.time()}, f)
+        time.sleep(0.35)     # 等守护进程轮询到变化并 set_image
         return True
     except Exception:
         return False

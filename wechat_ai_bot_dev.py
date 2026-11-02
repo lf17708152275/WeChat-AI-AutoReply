@@ -8,6 +8,7 @@ import hashlib
 import ctypes
 import threading
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageGrab
@@ -1357,16 +1358,18 @@ def _deliver_reply(target, texts, signature, hwnd, rect, layout, cfg, source="sc
     return True
 
 
-def _schedule_outbox(target, texts, signature, delay_s, source):
+def _schedule_outbox(target, texts, signature, delay_s, source, stickers=None):
     if isinstance(texts, str):
         texts = [texts]
     texts = [str(t).strip() for t in (texts or []) if str(t or "").strip()]
-    if delay_s <= 0 or not texts:
+    stickers = [str(u).strip() for u in (stickers or []) if str(u or "").strip()]
+    if delay_s <= 0 or (not texts and not stickers):
         return False
     with AGENT_LOCK:
         AGENT_OUTBOX.append({
             "target": target,
             "texts": texts,
+            "stickers": stickers,
             "signature": signature,
             "due_ts": time.time() + delay_s,
             "attempt": 0,
@@ -1475,6 +1478,122 @@ def _decision_segments(decision):
     return deduped[:MAX_REPLY_SEGMENTS]
 
 
+# ---------------------------------------------------------------------------
+# 表情包（表情来自 DSH 的表情插件：形如 http://127.0.0.1:25675/x-nekowhale-stickers/s/xxx.gif）
+# ---------------------------------------------------------------------------
+STICKER_PATH_MARK = "/x-nekowhale-stickers/"
+STICKER_MAX_BYTES = 12 * 1024 * 1024
+STICKER_TMP_DIR = "/tmp/wx_bot_stickers"
+_STICKER_LOGGED = set()
+
+
+def _decision_stickers(decision):
+    """从决策里取出可发送的表情 URL（只认本机/局域网的表情插件链接）。"""
+    raw = (decision or {}).get("stickers")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        url = str(item or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if STICKER_PATH_MARK not in url:
+            continue
+        if url not in out:
+            out.append(url)
+    return out[:2]
+
+
+def download_sticker(url):
+    """下载表情到本地临时文件；失败返回 None。"""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "192.168.31.20"):
+            log(f"⚠️ [表情] 拒绝下载非本机地址的表情: {host}")
+            return None
+        # 统一走回环，避免 nginx/Host 校验差异
+        netloc = f"127.0.0.1:{parsed.port or 25675}"
+        safe_url = urlunparse(("http", netloc, parsed.path, "", parsed.query, ""))
+        os.makedirs(STICKER_TMP_DIR, exist_ok=True)
+        tail = re.sub(r"[^0-9a-zA-Z]+", "", parsed.path.split("/")[-1]) or "sticker"
+        path = os.path.join(STICKER_TMP_DIR, f"{int(time.time()*1000)}_{tail}.gif")
+        req = urllib.request.Request(safe_url, headers={"User-Agent": "wechat-ai-bot/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = resp.read(STICKER_MAX_BYTES + 1)
+        if not data or len(data) > STICKER_MAX_BYTES:
+            log(f"⚠️ [表情] 下载内容为空或过大（{len(data)} 字节）")
+            return None
+        if not (data[:3] == b"GIF" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"\xff\xd8"):
+            log("⚠️ [表情] 下载内容不是图片，跳过")
+            return None
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception as exc:
+        log(f"⚠️ [表情] 下载失败: {str(exc)[:120]}")
+        return None
+
+
+def _send_sticker_image(hwnd, layout, target, path):
+    """把本地图片贴进当前聊天并发出去（渲染预览 → Enter 发送）。"""
+    if not lx:
+        return False
+    img_now, _, _ = grab_wechat_window(hwnd)
+    cur_W, cur_H = img_now.size
+    cur_layout = compute_wechat_layout(cur_W, cur_H, img_now)
+    hidden = bool(lx.is_hidden(hwnd))
+
+    if hidden:
+        if not lx.focus_window(hwnd):
+            log("🚫 [表情] 离屏模式下拿不到键盘焦点，跳过")
+            return False
+    else:
+        if not activate_wechat(hwnd):
+            log("🚫 [表情] 微信没拿到键盘焦点，跳过（防止图片贴到别的窗口）")
+            return False
+        input_safe_x = int(0.55 * cur_W)
+        input_safe_y = int(cur_H - cur_layout["input_h"] * 0.55)
+        post_click_client_point(hwnd, input_safe_x, input_safe_y)
+        time.sleep(0.10)
+        if not activate_wechat(hwnd):
+            log("🚫 [表情] 点击输入框后焦点脱失，跳过")
+            return False
+
+    if not lx.clipboard_copy_image(path):
+        log("⚠️ [表情] 图片写剪贴板失败")
+        return False
+    time.sleep(0.25)
+    _key_combo(0x56)                 # Ctrl+V 贴图
+    time.sleep(0.9)                  # 等出现图片预览
+    _key_combo(0x0D, ctrl=False)     # Enter 发送
+    time.sleep(0.9)
+    return True
+
+
+def _deliver_stickers(target, urls, signature, hwnd, rect, layout, cfg, source="agent"):
+    """逐张发表情；失败不重试（宁可少一张，也不重复刷屏）。"""
+    sent = 0
+    for url in urls or []:
+        path = download_sticker(url)
+        if not path:
+            continue
+        try:
+            if _send_sticker_image(hwnd, layout, target, path):
+                sent += 1
+                log(f"🎨 [表情] 已发给【{target}】: {url.rsplit('/', 1)[-1]}")
+            time.sleep(0.5)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return sent > 0
+
+
 def poll_agent_results(hwnd, rect=None, layout=None):
     """
     主循环每个心跳调用一次：
@@ -1504,7 +1623,10 @@ def poll_agent_results(hwnd, rect=None, layout=None):
 
         action = str(decision.get("action") or "reply").lower()
         segments = _decision_segments(decision)
+        stickers = _decision_stickers(decision)
         text = " / ".join(segments)          # 仅用于日志展示
+        if stickers:
+            text = (text + "  🎨" if text else "🎨").strip()
         urgency = str(decision.get("urgency") or "now").lower()
         reason = str(decision.get("reason") or "")
         cost = item.get("cost") or 0.0
@@ -1534,27 +1656,31 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         if action == "defer":
             LAST_PROCESSED_SIGNATURE[target] = signature
             delay = client.urgency_to_seconds(urgency) if client else 60.0
-            if segments:
-                _schedule_outbox(target, segments, signature, delay, "defer")
+            if segments or stickers:
+                _schedule_outbox(target, segments, signature, delay, "defer", stickers=stickers)
             else:
                 log(f"⏸️ [Agent 判定稍后再说] 好友【{target}】: {reason}")
             continue
 
         # action == reply
-        if not segments:
-            log(f"⚠️ [Agent 空回复] 好友【{target}】无正文，跳过")
+        if not segments and not stickers:
+            log(f"⚠️ [Agent 空回复] 好友【{target}】无正文也无表情，跳过")
             LAST_PROCESSED_SIGNATURE[target] = signature
             continue
 
         delay = client.urgency_to_seconds(urgency) if client else 0.0
         if delay > 0:
             LAST_PROCESSED_SIGNATURE[target] = signature
-            _schedule_outbox(target, segments, signature, delay, "agent")
+            _schedule_outbox(target, segments, signature, delay, "agent", stickers=stickers)
             continue
 
         log(f"💬 [Agent 决策] 好友【{target}】: {text}  (urgency={urgency}, 耗时 {cost:.1f}s)")
-        if _deliver_reply(target, segments, signature, hwnd, rect, layout, cfg, source="agent"):
+        if segments and _deliver_reply(target, segments, signature, hwnd, rect, layout, cfg, source="agent"):
             did_send = True
+        if stickers:
+            time.sleep(0.4)
+            if _deliver_stickers(target, stickers, signature, hwnd, rect, layout, cfg, source="agent"):
+                did_send = True
 
     # ---------- 2) 到点的延时队列 ----------
     now = time.time()
@@ -1570,7 +1696,10 @@ def poll_agent_results(hwnd, rect=None, layout=None):
             log(f"🗑️ [撤销待发] 好友【{target}】有更新消息在决策中，丢弃旧计划")
             continue
         pending_texts = entry.get("texts") or entry.get("text") or []
-        if _deliver_reply(target, pending_texts, entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
+        if pending_texts and _deliver_reply(target, pending_texts, entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
+            did_send = True
+        pending_stickers = entry.get("stickers") or []
+        if pending_stickers and _deliver_stickers(target, pending_stickers, entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
             did_send = True
 
     return did_send
@@ -1580,6 +1709,7 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
     """线程池提交失败时的同步兜底：直接处理决策（会短暂阻塞主循环，仅在异常路径发生）。"""
     action = str((decision or {}).get("action") or "reply").lower()
     segments = _decision_segments(decision)
+    stickers = _decision_stickers(decision)
     text = " / ".join(segments)          # 仅用于日志展示
     urgency = str((decision or {}).get("urgency") or "now").lower()
     reason = str((decision or {}).get("reason") or "")
@@ -1595,7 +1725,7 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
         if segments:
             _schedule_outbox(target, segments, signature, delay, "defer-sync")
         return False
-    if not segments:
+    if not segments and not stickers:
         LAST_PROCESSED_SIGNATURE[target] = signature
         return False
 
@@ -1603,11 +1733,15 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
     delay = client.urgency_to_seconds(urgency) if client else 0.0
     if delay > 0:
         LAST_PROCESSED_SIGNATURE[target] = signature
-        _schedule_outbox(target, segments, signature, delay, "agent-sync")
+        _schedule_outbox(target, segments, signature, delay, "agent-sync", stickers=stickers)
         return False
 
     log(f"💬 [Agent 决策·同步] 好友【{target}】: {text}")
-    return _deliver_reply(target, segments, signature, hwnd, rect, layout, cfg, source="agent-sync")
+    sent = _deliver_reply(target, segments, signature, hwnd, rect, layout, cfg, source="agent-sync") if segments else False
+    if stickers:
+        time.sleep(0.4)
+        sent = _deliver_stickers(target, stickers, signature, hwnd, rect, layout, cfg, source="agent-sync") or sent
+    return sent
 
 
 def count_green_bubble_metrics(img, layout):
