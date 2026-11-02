@@ -1542,10 +1542,37 @@ def _send_sticker_image(hwnd, layout, target, path):
     """把本地图片贴进当前聊天并发出去（渲染预览 → Enter 发送）。"""
     if not lx:
         return False
+
+    # --- 发表情同样要先核验顶栏：绝不把表情发错人 ---
     img_now, _, _ = grab_wechat_window(hwnd)
+    if img_now is None:
+        log("⚠️ [表情] 抓不到微信画面，跳过")
+        return False
+    hidden = bool(lx.is_hidden(hwnd))
+    _, _, _, cur_title = _scan_window(hwnd)
+    if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+        log(f"⚠️ [表情纠偏] 当前顶栏【{cur_title or '未知'}】不是【{target}】，先切过去")
+        if hidden:
+            lx.show_window(hwnd)
+            time.sleep(0.30)
+        switched = _linux_search_and_open(hwnd, target)
+        if hidden:
+            lx.hide_window(hwnd)
+            time.sleep(0.30)
+        if not switched:
+            log(f"🚫 [表情中止] 无法锁定会话【{target}】，放弃发这张表情")
+            return False
+        time.sleep(0.40)
+        img_now, _, _ = grab_wechat_window(hwnd)
+        if img_now is None:
+            return False
+        _, _, _, cur_title = _scan_window(hwnd)
+        if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+            log(f"🚫 [表情中止] 切换后顶栏仍是【{cur_title or '未知'}】")
+            return False
+
     cur_W, cur_H = img_now.size
     cur_layout = compute_wechat_layout(cur_W, cur_H, img_now)
-    hidden = bool(lx.is_hidden(hwnd))
 
     if hidden:
         if not lx.focus_window(hwnd):
