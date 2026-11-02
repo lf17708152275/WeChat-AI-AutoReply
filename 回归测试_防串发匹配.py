@@ -29,7 +29,14 @@ def extract(path, names, ns):
             exec(compile(ast.get_source_segment(src, node), path, "exec"), ns)
     return ns
 
-ns = extract(BOT, {"normalize_for_match", "is_group_chat_name", "is_name_matched_strict"}, {"re": re})
+# 人格卡模块提供 normalize_title（剥未读数尾缀），匹配逻辑依赖它，得一起注入
+sys.path.insert(0, BASE)
+try:
+    import persona_cards as _pcards
+except Exception:
+    _pcards = None
+ns = extract(BOT, {"normalize_for_match", "is_group_chat_name", "is_name_matched_strict"},
+             {"re": re, "pcards": _pcards})
 is_group_chat_name = ns["is_group_chat_name"]
 is_name_matched_strict = ns["is_name_matched_strict"]
 
@@ -56,6 +63,14 @@ print("=== 3. 取舍用例（名+预览无空格拼接行，本批起设计为�
 for name in ["张三你好啊今天天气真好", "张三12:30"]:
     got, _ = is_name_matched_strict(name, ["张三"])
     check(f"拒绝(取舍) {name!r}", got, False)
+
+print("=== 3.5 数字开头的备注（如「22-撩人精」）+ 未读数尾缀 ===")
+for name in ["22-撩人精", "22-撩人精(2)", "22-撩人精 在干嘛", "22-撩人精(2) 在干嘛"]:
+    got, _ = is_name_matched_strict(name, ["22-撩人精"])
+    check(f"命中 {name!r}", got, True)
+for name in ["22-撩人精2", "22-撩人精儿"]:
+    got, _ = is_name_matched_strict(name, ["22-撩人精"])
+    check(f"仍拒绝越配 {name!r}", got, False)
 
 print("=== 4. 群聊防火墙基线（P1 待修，本批不改其行为） ===")
 check("真群 吃喝玩乐(25)", is_group_chat_name("吃喝玩乐(25)"), True)

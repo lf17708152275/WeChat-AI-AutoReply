@@ -3,17 +3,40 @@ import sys
 import time
 import json
 import re
+import random
 import hashlib
 import ctypes
 import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from ctypes import wintypes
 import numpy as np
 from PIL import Image, ImageGrab
 import requests
-import pyperclip
 from rapidocr_onnxruntime import RapidOCR
+
+# Linux 适配：Win32 专属依赖在 Linux 上不存在，全部降级为可选
+IS_WIN = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+
+if IS_WIN:
+    from ctypes import wintypes
+else:
+    wintypes = None
+    try:
+        import wechat_linux_io as lx        # X11 后端（抓图/点击/键盘/剪贴板）
+    except Exception as _lx_err:            # 缺 python-xlib 等依赖时要能一眼看出来
+        lx = None
+        _LX_IMPORT_ERR = _lx_err
+
+try:
+    import pyperclip
+except Exception:                           # Linux 无 xclip/xsel 时 import 即失败
+    pyperclip = None
+
+try:
+    import persona_cards as pcards
+except Exception:                     # 缺文件时退回纯 system_prompt 老路径
+    pcards = None
 
 try:
     from agent_client import AgentClient, build_prompt
@@ -27,20 +50,25 @@ else:
 # =============================================================================
 # 0. WIN32 API DEFINITIONS & DESKTOP BINDING
 # =============================================================================
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
-shcore = ctypes.windll.shcore
-kernel32 = ctypes.windll.kernel32
+if IS_WIN:
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    shcore = ctypes.windll.shcore
+    kernel32 = ctypes.windll.kernel32
 
-try:
-    shcore.SetProcessDpiAwareness(2) # Per-monitor DPI aware
-except Exception:
     try:
-        user32.SetProcessDPIAware()
+        shcore.SetProcessDpiAwareness(2) # Per-monitor DPI aware
     except Exception:
-        pass
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+else:
+    user32 = gdi32 = shcore = kernel32 = None
 
 def ensure_default_desktop():
+    if IS_LINUX:
+        return                       # X11 没有「桌面切换」，无需绑定
     try:
         h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
         if h_desk:
@@ -138,6 +166,11 @@ LAST_FULL_SCAN_TIME = 0
 # -----------------------------------------------------------------------------
 AGENT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
 AGENT_LOCK = threading.RLock()
+
+# 主循环每轮把找到的微信窗口缓存在这里，供 HTTP 线程读取。
+# 血泪坑：python-xlib 的 Display 连接不是线程安全的，直接在 HTTP 线程里调
+# get_wechat_hwnd() 会跟主线程抢 Xlib 连接卡死（/status 一直不返回）。
+WECHAT_HWND_CACHE = [None]
 AGENT_PENDING = {}      # job_id -> {"target","signature","message","submit_ts","source"}
 AGENT_RESULTS = {}      # job_id -> {"target","signature","decision","done_ts","cost"}
 AGENT_INFLIGHT = {}     # target -> job_id（同一好友只允许一个在飞，新消息覆盖旧的）
@@ -196,7 +229,6 @@ def load_config():
             "allow_search": True,
             "confirm_expire_hours": 12
         },
-        "friend_personas": {},
         "contacts": []
     }
 
@@ -225,6 +257,8 @@ def cfg_float(dct, key, default):
 # 3. DPI & PHYSICAL LAYOUT ENGINE (WINDOW-SIZE INVARIANT)
 # =============================================================================
 def get_dpi_scale():
+    if IS_LINUX:
+        return 1.0                   # X11 下图像即物理像素，实测 1:1
     try:
         hdc = user32.GetDC(0)
         log_w = gdi32.GetDeviceCaps(hdc, 8)  # HORZRES
@@ -235,15 +269,57 @@ def get_dpi_scale():
     except Exception:
         return 1.0
 
-def compute_wechat_layout(W, H):
+def _detect_chat_start_x(img, header_h, input_h):
+    """用像素扫描找出左侧会话列表与右侧聊天区的分界线 x。
+
+    微信 4.x 的会话列表是**固定像素宽**（约 354px，加上左侧图标栏约 90px ≈ 444），
+    不随窗口宽度按比例缩放；按比例估算会少算 100px+，把列表里的昵称/预览/时间
+    当成聊天气泡 OCR 进来（实测 Agent 收到的消息变成「昨天17:42，吃饭了，吃饭了」）。
+    扫输入框上方那段空白：列表背景 ~#EEEEF0（亮度和 ≈714），聊天区背景 ~#F7F7F7（≈741），
+    取第一条持续变亮的列作为分界线。失败返回 None。
+    """
+    try:
+        arr = np.asarray(img.convert("RGB"))
+        H, W = arr.shape[:2]
+        y0 = max(header_h + 20, H - input_h - 90)
+        y1 = max(y0 + 1, H - int(input_h * 0.9))
+        band = arr[y0:y1]
+        if band.size == 0:
+            return None
+        cols = band.mean(axis=(0, 2))
+        start = int(W * 0.18)
+        stop = int(W * 0.72)
+        run = 0
+        for x in range(start, stop):
+            if cols[x] >= 244.0:
+                run += 1
+                if run >= 6:
+                    return x - run + 1
+            else:
+                run = 0
+        return None
+    except Exception:
+        return None
+
+
+def compute_wechat_layout(W, H, img=None):
     """
     基于微信 PC 客户端原生物理布局结构计算关键区域：
     无论窗口拉宽、拉高、缩小或最大化，物理像素绝对精准咬合。
+    img 传入时用像素扫描精确定位右侧聊天区起点（推荐），否则退回比例估算。
     """
     sidebar_w = max(55, int(0.055 * W))
-    chat_start_x = max(320, int(0.285 * W))
-    header_h = max(85, int(0.110 * H))
+    # 顶栏/输入框尺寸要先算，像素扫描会用它们定位空白带
+    header_h = max(88, int(0.140 * H))
     input_h = min(220, max(140, int(0.160 * H)))
+    chat_start_x = None
+    if img is not None:
+        chat_start_x = _detect_chat_start_x(img, header_h, input_h)
+    if not chat_start_x:
+        chat_start_x = max(320, int(0.285 * W))
+    # 顶栏高度：微信 4.x 的标题行随窗口高度略微下移，
+    # 原来 max(85, 0.110*H) 在 756 高的窗口上只给到 85，而标题 cy≈90 被切掉 →
+    # 顶栏 OCR 全空 → 白名单匹配失败 → 收到消息也不回（2026-11-02 实测踩到）。
     
     return {
         "sidebar_w": sidebar_w,
@@ -254,9 +330,17 @@ def compute_wechat_layout(W, H):
         "total_h_px": H
     }
 
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
+if IS_WIN:
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
+else:
+    WNDENUMPROC = None            # Linux 走窗树递归，不需要 EnumWindows 回调
 
 def get_wechat_hwnd():
+    if IS_LINUX:
+        if lx is None:
+            _warn_throttled("lx_missing", f"⚠️ [Linux 后端不可用] {globals().get('_LX_IMPORT_ERR')}")
+            return None, None
+        return lx.find_wechat_window()
     ensure_default_desktop()
     candidates = []
     def enum_proc(hwnd, lp):
@@ -306,6 +390,20 @@ def grab_wechat_window(hwnd):
     开发版后台静默离屏抓图引擎（PrintWindow / DWM）：
     无论微信被其他窗口覆盖压在底层还是处于离屏隐形状态，都能静默抓取微信自身的 100% 真实画面！
     """
+    if IS_LINUX:
+        if lx is None:
+            return None, None, 1.0
+        img, rect, scale = lx.grab_window(hwnd)
+        if img is not None:
+            # 全黑图兜底判定（与 Windows 侧同一套阈值）
+            try:
+                arr = np.asarray(img)
+                if arr.size == 0 or int(arr.max()) <= 10 or float(arr.std()) < 1.0:
+                    _warn_throttled("grab_blank_linux", "⚠️ [抓图空白] X11 抓到的微信画面是纯色/空白，本轮跳过")
+                    return None, rect, scale
+            except Exception:
+                pass
+        return img, rect, scale
     try:
         # PrintWindow 对隐藏/最小化窗口只会返回全黑图，抓之前先确保窗口可见。
         # 注意：最小化的窗口 IsWindowVisible 仍是 True，必须额外判 IsIconic，
@@ -412,6 +510,8 @@ def activate_wechat(hwnd):
     Win32 穿透提权引擎：
     突破 Windows 10/11 防抢焦点 (ASFW) 与输入队列隔离，赋予微信合法键盘输入权限。
     """
+    if IS_LINUX:
+        return bool(lx and lx.activate(hwnd))
     try:
         ensure_default_desktop()
         if user32.IsIconic(hwnd):
@@ -454,7 +554,11 @@ def _nonclient_offset(hwnd):
     （实测微信 4.15 在本机是左边框 12px、上边框 0px）；
     而 PostMessage 的 WM_LBUTTONDOWN 用的是「客户区」坐标。
     两者必须换算，否则所有点击会整体左偏 —— 侧栏点不中会话行就是这么来的。
+
+    Linux 侧抓的就是整窗区域，图像坐标 == 窗口坐标，偏移恒为 0。
     """
+    if IS_LINUX:
+        return 0, 0
     try:
         r = wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(r))
@@ -474,6 +578,8 @@ def ensure_wechat_visible(hwnd):
     接着 OCR 就拿浏览器内容去匹配联系人 —— 这是真机连续失败的根因链条。
     注意：把窗口挪到屏幕外是可以的（PrintWindow 照样能画），SW_HIDE 不行。
     """
+    if IS_LINUX:
+        return bool(lx and lx.ensure_visible(hwnd))
     try:
         if not hwnd:
             return False
@@ -494,7 +600,14 @@ def post_click_client_point(hwnd, client_x, client_y):
     绝对不调用 SetCursorPos，物理鼠标 1 个像素都不会动！
 
     传入的是「抓图像素坐标」，内部会减去非客户区偏移换成客户区坐标。
+
+    Linux 侧用 XTest 真实点击（Qt 对 PostMessage 等价物不可靠）。
+    代价是会真的移动光标；这是 X11 下唯一稳定的注入方式。
     """
+    if IS_LINUX:
+        if lx:
+            lx.click_client(hwnd, client_x, client_y)
+        return
     try:
         dx, dy = _nonclient_offset(hwnd)
         cx = int(client_x) - dx
@@ -542,6 +655,41 @@ def is_group_chat_name(text):
         return True
     return False
 
+def looks_like_group(text):
+    """群聊粗筛，但放行「明显是未读数后缀」的文本。
+
+    会话被选中时显示的是 "备注(未读数)"，跟群聊的 "群名(人数)" 长得一样。
+    区别在于：剥掉括号后能精确命中白名单的，按未读数处理 —— 这正是
+    is_name_matched_strict 里剥变体 + 严格全等要做的事，所以这里不要提前一票否决。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if re.search(r'群聊|交流群|互助群|通知群|工作群|家族群|同乡群|部门群', t):
+        return True
+    # 剥掉尾部括号数字后仍有内容 -> 末位括号数字按"未读数"处理，交给白名单精确判定
+    # 剥掉尾缀后还带群关键词（"ai聊天群(3)"）-> 仍是群
+    tail_stripped = re.sub(r'\s*[\(（]\d+[\)）]\s*$', '', t).strip()
+    if tail_stripped and tail_stripped != t:
+        # 剥完仍是群名（"ai聊天群(3)"）或尾巴后面还有预览（"吃喝玩乐(25) 张三：好的"）-> 群
+        if re.search(r'群聊|交流群|互助群|通知群|工作群|家族群|同乡群|部门群', tail_stripped):
+            return True
+        # "吃喝玩乐(25) 张三：好的" —— 括号人数后面还跟着预览文字，是真群
+        m = re.search(r'[\(（]\d+[\)）](\s*\S.*)$', t)
+        if m and re.sub(r'[：:]$', '', m.group(1).strip()):
+            return True
+        return False
+    # 尾缀后面还跟着预览文字 -> 真群聊（"吃喝玩乐(25) 张三：好的"）
+    m = re.search(r'[\(（]\d+[\)）](\s*\S.*)$', t)
+    if m and re.sub(r'[：:]$', '', m.group(1).strip()):
+        return True
+    # 名字中间带人数、预览在第二段 -> 兼容 "吃喝玩乐 (25) 张三：好的"
+    parts = re.split(r'\s+', t)
+    if len(parts) >= 2 and re.match(r'^[\(（]\d+[\)）]$', parts[1]):
+        return True
+    return False
+
+
 def is_name_matched_strict(contact_name, whitelist):
     if not contact_name or len(str(contact_name).strip()) < 2:
         return False, ""
@@ -552,11 +700,42 @@ def is_name_matched_strict(contact_name, whitelist):
     stripped = re.sub(r'^\d{1,2}(?=[^\d])', '', c_raw).strip()
     if stripped and len(stripped) >= 2 and stripped != c_raw:
         raw_variants.append(stripped)
+    # 会话行/顶栏偶尔带未读数后缀（"22-撩人精(2)" / "22-撩人精(2) 在干嘛"），
+    # 剥一份变体一起匹配；末尾带预览的，再把预览切掉试一次
+    if pcards:
+        no_unread = pcards.normalize_title(c_raw)
+        if no_unread and no_unread != c_raw:
+            raw_variants.append(no_unread)
+        m_unread = re.match(r'^(.*?\S)\s*[\(（]\s*\d+\s*[\)）]\s*(.+)$', c_raw)
+        if m_unread:
+            name_part = m_unread.group(1).strip()
+            if name_part and name_part not in raw_variants:
+                raw_variants.append(name_part)
 
-    for r in raw_variants:
-        # 群聊防火墙：精准检测群人数标识 (如 "(25)"、" (25)") 与群关键词，排除消息预览中的量词数字 (如 "(2)楼"、"(5)分")
-        if is_group_chat_name(r):
-            return False, ""
+    # 群聊防火墙只否决「名字本身就像群」的文本（"吃喝玩乐(25)"、"工作群"）。
+    # 但 "老爸(3)" / "22-撩人精(2)" 剥掉尾缀能精确命中白名单，那就是未读数，不能误杀 ——
+    # 所以命中白名单时用原始文本返回，后续群名判定仍按原名走，不会把群放进来。
+    strictly_matched = False
+    if pcards:
+        for t in whitelist:
+            t_clean = str(t or "").strip()
+            if not t_clean:
+                continue
+            # 只有「剥掉未读数尾缀后差一个 (n)」这一种情况才放行；
+            # 白名单里明写了 "吃喝玩乐(25)" / "工作群" 的，仍然按群处理，不破原有防线。
+            if any(
+                normalize_for_match(r) == normalize_for_match(t_clean)
+                and not is_group_chat_name(t_clean)
+                for r in raw_variants
+            ):
+                strictly_matched = True
+                break
+
+    if not strictly_matched:
+        for r in raw_variants:
+            # 精准检测群人数标识 (如 "(25)"、" (25)") 与群关键词，排除消息预览中的量词数字 (如 "(2)楼"、"(5)分")
+            if is_group_chat_name(r):
+                return False, ""
 
     for r in raw_variants:
         norm_ocr = normalize_for_match(r)
@@ -777,7 +956,18 @@ def extract_active_chat_title(res, layout):
             
     # 按水平从左到右严格排序，确保分段识别的标题词序绝对正确
     title_candidates.sort(key=lambda x: x[0])
-    return " ".join(t for _, t in title_candidates)
+    # 未读数有时会被 OCR 单独识别成一个候选（"22-撩人精" + "(2)"），
+    # 先逐个剥掉再拼，避免标题变成 "22-撩人精 (2)" 导致白名单匹配失败
+    if pcards:
+        title_candidates = [(cx, pcards.normalize_title(t)) for cx, t in title_candidates]
+        title_candidates = [(cx, t) for cx, t in title_candidates if t]
+    title = " ".join(t for _, t in title_candidates)
+    # 未读数会跟在标题后面（Linux 4.1.26 实测是 "ai聊天群(3)"），
+    # 不剥掉会让 is_name_matched_strict 判定失败，误以为"不是目标会话"。
+    # 数字开头的备注（如「22-撩人精」）也必须能原样匹配上，所以统一走 normalize_title。
+    if pcards:
+        return pcards.normalize_title(title)
+    return re.sub(r"\s*[（(]\s*\d+\s*[)）]\s*$", "", title).strip()
 
 # =============================================================================
 # 5. CHROMATIC BUBBLE PARSER & MULTI-LINE AGGREGATION
@@ -907,27 +1097,16 @@ def generate_ai_reply(sender, message_content):
     now_time = time.strftime("%H:%M")
     
     custom_prompt = (cfg.get("system_prompt") or "").strip()
-    persona_desc = ((cfg.get("friend_personas") or {}).get(sender) or "").strip()
-    
+
     if custom_prompt:
-        if persona_desc:
-            system_prompt = (
-                f"{custom_prompt}\n"
-                f"【当前互动好友】：好友【{sender}】，当前时间{now_time}。\n"
-                f"【该好友专属人设】：{persona_desc}\n"
-                f"【对话规则】：直接输出发给对方的一句中文，口语化自然、简练得体。严禁括号描写心理活动，严禁透露AI身份。"
-            )
-        else:
-            system_prompt = (
-                f"{custom_prompt}\n"
-                f"【当前互动好友】：好友【{sender}】，当前时间{now_time}。\n"
-                f"【对话规则】：直接输出发给对方的一句中文，口语化自然、简练得体。严禁括号描写心理活动，严禁透露AI身份。"
-            )
+        system_prompt = (
+            f"{custom_prompt}\n"
+            f"【当前互动好友】：好友【{sender}】，当前时间{now_time}。\n"
+            f"【对话规则】：直接输出发给对方的一句中文，口语化自然、简练得体。严禁括号描写心理活动，严禁透露AI身份。"
+        )
     else:
-        fallback_persona = persona_desc or "幽默风趣、随和自然的真实好友"
         system_prompt = (
             f"你现在是微信账号的主人本人（真实真人），正在微信上与好友【{sender}】聊天。当前时间是{now_time}。\n"
-            f"【专属人设风格】：{fallback_persona}\n"
             f"【对话规则】：直接输出发给对方的一句中文，口语化自然、简练得体。严禁括号描写心理活动，严禁透露AI身份。"
         )
     
@@ -975,7 +1154,8 @@ def generate_ai_reply(sender, message_content):
 # =============================================================================
 _AGENT_CLIENT = [None]
 _AGENT_CLIENT_KEY = [None]
-AGENT_OUTBOX = []   # [{"target","text","signature","due_ts","attempt","source"}]
+AGENT_OUTBOX = []   # [{"target","texts":[...],"signature","due_ts","attempt","source"}]
+MAX_REPLY_SEGMENTS = 4   # 一次决策最多拆几条发（太多像刷屏，真人连发 1-3 条最自然）
 
 
 def get_agent_client(cfg=None):
@@ -1011,10 +1191,9 @@ def generate_agent_reply(sender, message_content):
             "urgency": "now",
             "reason": "agent_unavailable",
         }
-    persona = ((cfg.get("friend_personas") or {}).get(sender) or "").strip()
-    prompt = build_prompt(sender, message_content, persona) if build_prompt else message_content
+    prompt = build_prompt(sender, message_content) if build_prompt else message_content
     # 有微信号就用微信号当会话键：ASCII 稳定，且换备注/换昵称不丢记忆
-    return client.ask(client.context_id_for(contact_context_id(sender, cfg)), prompt)
+    return client.ask(client.context_id_for(contact_context_id(sender, cfg)), prompt, target=sender)
 
 
 def _drop_outbox_for(target, reason=""):
@@ -1028,6 +1207,24 @@ def _drop_outbox_for(target, reason=""):
         log(f"🗑️ [撤销待发] 好友【{target}】的 {removed} 条延时计划已作废{f'（{reason}）' if reason else ''}")
 
 
+_ROUTE_LOGGED = {}
+
+
+def _log_route_once(target, url, client=None):
+    """每个好友第一次走 A2A 时打一行，方便肉眼确认"他走的是哪个关系端点"。"""
+    if not target or not url:
+        return
+    if _ROUTE_LOGGED.get(target) == url:
+        return
+    _ROUTE_LOGGED[target] = url
+    rel = ""
+    try:
+        rel = (client.relation_of(target) if client is not None else "") or ""
+    except Exception:
+        rel = ""
+    log(f"🔀 [A2A 路由] 好友【{target}】→ {('关系「' + rel + '」→ ') if rel else ''}{url}")
+
+
 def submit_agent_job(target, message, signature, cfg=None, source="scan"):
     """提交一次「该回什么」的决策请求，立刻返回 job_id（不阻塞主循环）。"""
     cfg = cfg if cfg is not None else load_config()
@@ -1035,8 +1232,11 @@ def submit_agent_job(target, message, signature, cfg=None, source="scan"):
     if client is None:
         return None
 
-    persona = ((cfg.get("friend_personas") or {}).get(target) or "").strip()
-    prompt = build_prompt(target, message, persona) if build_prompt else message
+    prompt = build_prompt(target, message) if build_prompt else message
+    try:
+        _log_route_once(target, client.url_for(target), client)
+    except Exception:
+        pass
     # 有微信号就用微信号当会话键：ASCII 稳定，且换备注/换昵称不丢记忆
     ctx = client.context_id_for(contact_context_id(target, cfg))
 
@@ -1057,7 +1257,7 @@ def submit_agent_job(target, message, signature, cfg=None, source="scan"):
     def _worker():
         t0 = time.time()
         try:
-            decision = client.ask(ctx, prompt)
+            decision = client.ask(ctx, prompt, target=target)
         except Exception as exc:  # AgentClient 内部已兜底，这里只是最后一道保险
             log(f"🚨 [Agent 线程异常] 好友【{target}】: {exc}")
             decision = {
@@ -1078,6 +1278,7 @@ def submit_agent_job(target, message, signature, cfg=None, source="scan"):
             AGENT_RESULTS[job_id] = {
                 "target": target,
                 "signature": signature,
+                "message": message,
                 "decision": decision,
                 "done_ts": time.time(),
                 "cost": cost,
@@ -1097,71 +1298,181 @@ def submit_agent_job(target, message, signature, cfg=None, source="scan"):
     return job_id
 
 
-def _deliver_reply(target, text, signature, hwnd, rect, layout, cfg, source="scan"):
-    """在主线程真正把一句话发出去（含前缀 / 拟人延迟 / 失败重试登记）。"""
+def _segment_gap_seconds(segment, cfg=None):
+    """两段消息之间的停顿：按字数估算打字时间 + 抖动，像真人在分条发。"""
+    cfg = cfg or {}
+    base = cfg_float(cfg, "segment_delay_min_seconds", 0.45)
+    span = cfg_float(cfg, "segment_delay_span_seconds", 0.9)
+    typed = min(span, len(str(segment or "")) * 0.035)
+    return base + typed + random.uniform(0.0, 0.35)
+
+
+def _deliver_reply(target, texts, signature, hwnd, rect, layout, cfg, source="scan"):
+    """在主线程把一段或多段话真正发出去（含前缀 / 拟人延迟 / 段间停顿 / 失败重试登记）。
+
+    texts 可以是字符串，也可以是「多段」列表：多段会依次发送，段与段之间按
+    字数停一下，效果等同真人连发几条微信，而不是把一大段话挤成一条。
+    """
     prefix = cfg.get("reply_prefix", "") if cfg.get("include_prefix", False) else ""
-    final_reply = f"{prefix}{text}"
+    if isinstance(texts, str):
+        texts = [texts]
+    payload = [f"{prefix}{t}" for t in (texts or []) if str(t or "").strip()]
+    if not payload:
+        return False
 
     reply_delay = cfg_float(cfg, "reply_delay_seconds", 0.0)
     if reply_delay > 0:
         time.sleep(reply_delay)
 
-    ok = send_reply_instant(hwnd, rect, layout, target, final_reply)
-    if ok:
-        LAST_PROCESSED_SIGNATURE[target] = signature
-        SEND_FAIL_RETRY.pop(signature, None)
-        return True
+    for idx, segment in enumerate(payload):
+        if idx > 0:
+            time.sleep(_segment_gap_seconds(segment, cfg))
+        if send_reply_instant(hwnd, rect, layout, target, segment):
+            continue
 
-    fail_count = SEND_FAIL_RETRY.get(signature, 0) + 1
-    SEND_FAIL_RETRY[signature] = fail_count
-    if fail_count >= 2:
-        LAST_PROCESSED_SIGNATURE[target] = signature
-        SEND_FAIL_RETRY.pop(signature, None)
-        log(f"🚫 [重试超限熔断] 好友【{target}】消息连续 2 次发送脱靶，已放弃该条回复以防死循环。")
+        # 这一段（含后面还没发的）脱靶：登记补偿重试，成功后继续
+        remaining = payload[idx:]
+        fail_count = SEND_FAIL_RETRY.get(signature, 0) + 1
+        SEND_FAIL_RETRY[signature] = fail_count
+        if fail_count >= 2:
+            LAST_PROCESSED_SIGNATURE[target] = signature
+            SEND_FAIL_RETRY.pop(signature, None)
+            log(f"🚫 [重试超限熔断] 好友【{target}】消息连续 2 次发送脱靶，已放弃该条回复以防死循环。")
+            return False
+
+        log(f"⚠️ [发送脱靶记录] 好友【{target}】第 {fail_count} 次发送未成，2 秒后补偿重试（剩余 {len(remaining)} 段）。")
+        with AGENT_LOCK:
+            AGENT_OUTBOX.append({
+                "target": target,
+                "texts": remaining,
+                "signature": signature,
+                "due_ts": time.time() + 2.0,
+                "attempt": fail_count,
+                "source": f"{source}-retry",
+            })
         return False
 
-    log(f"⚠️ [发送脱靶记录] 好友【{target}】第 {fail_count} 次发送未成，2 秒后补偿重试。")
+    LAST_PROCESSED_SIGNATURE[target] = signature
+    SEND_FAIL_RETRY.pop(signature, None)
+    return True
+
+
+def _schedule_outbox(target, texts, signature, delay_s, source):
+    if isinstance(texts, str):
+        texts = [texts]
+    texts = [str(t).strip() for t in (texts or []) if str(t or "").strip()]
+    if delay_s <= 0 or not texts:
+        return False
     with AGENT_LOCK:
         AGENT_OUTBOX.append({
             "target": target,
-            "text": text,
-            "signature": signature,
-            "due_ts": time.time() + 2.0,
-            "attempt": fail_count,
-            "source": f"{source}-retry",
-        })
-    return False
-
-
-def _schedule_outbox(target, text, signature, delay_s, source):
-    if delay_s <= 0:
-        return False
-    with AGENT_LOCK:
-        AGENT_OUTBOX.append({
-            "target": target,
-            "text": text,
+            "texts": texts,
             "signature": signature,
             "due_ts": time.time() + delay_s,
             "attempt": 0,
             "source": source,
         })
-    log(f"⏳ [延时待发] 好友【{target}】将在 {delay_s:.0f} 秒后发送: {text}")
+    log(f"⏳ [延时待发] 好友【{target}】将在 {delay_s:.0f} 秒后发送: {' / '.join(texts)}")
     return True
+
+
+_SIG_Y_BUCKET = 40  # 气泡纵向位置按 40px 分桶：OCR 抖动 ±几像素不再当成"新消息"
+
+
+def _msg_signature(target, combined_text, pending_bubbles):
+    """一条"待回复消息"的稳定指纹。
+
+    只取「谁 + 说了什么 + 几条 + 最后一条在哪个高度桶」。
+    历史坑：原先用 int(last_y) + len(chat_bubbles)，OCR 每帧抖 1 像素、或时间戳行
+    时有时无，签名就变 → 主循环以为来了新消息 → 反复提交 agent → 每轮结论又被
+    下一条"更新消息"作废 → 永久 livelock，日志刷屏且永远不回复。
+    """
+    try:
+        last_y = int(pending_bubbles[-1].get("last_y") or 0) if pending_bubbles else 0
+    except Exception:
+        last_y = 0
+    return (str(target), str(combined_text), len(pending_bubbles or []), last_y // _SIG_Y_BUCKET)
 
 
 def agent_busy_for(target, signature=None):
     """这个好友是否已有 agent 任务在飞 / 已有待发计划。signature 给定时只判同一条消息。"""
+    def _same_round(pend_like):
+        """同一条消息的判定：签名全等，或"收件人+原文"相同（签名可能因抖动而变）。"""
+        if pend_like is None:
+            return False
+        if pend_like.get("signature") == signature:
+            return True
+        if signature is not None and len(signature) >= 2:
+            return (pend_like.get("target") == signature[0]
+                    and pend_like.get("message") == signature[1])
+        return False
+
     with AGENT_LOCK:
         job_id = AGENT_INFLIGHT.get(target)
         if job_id:
             pend = AGENT_PENDING.get(job_id)
-            if signature is None or (pend and pend.get("signature") == signature):
+            if signature is None or _same_round(pend):
                 return True
         for entry in AGENT_OUTBOX:
             if entry["target"] == target:
-                if signature is None or entry.get("signature") == signature:
+                if signature is None or _same_round(entry):
                     return True
     return False
+
+
+def sanitize_outgoing_text(text):
+    """把 Agent 回复里不该出现在微信里的东西清掉。
+
+    背景：DSH profile 里装了 dsh-nekowhale-stickers 等插件，
+    Agent 会往回复里塞 markdown 表情包图片（![名字](http://.../x.gif)），
+    微信里发出去就是一行乱码。这里统一剥掉 markdown 图片/链接/代码块标记。
+    """
+    t = str(text or "")
+    if not t:
+        return ""
+    # markdown 图片：![alt](url)  以及裸的图片链接行
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
+    # markdown 链接保留文字： [文字](url) -> 文字
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+    # 裸 URL（图片/接口地址），整行去掉
+    t = re.sub(r"^\s*https?://\S+\s*$", "", t, flags=re.M)
+    # 代码块/行内代码标记
+    t = re.sub(r"```[a-zA-Z]*", "", t)
+    t = t.replace("`", "")
+    # 空行压缩
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+
+def _decision_segments(decision):
+    """把 agent 决策归一成「要逐条连发的消息列表」。
+
+    DSH 的回复长度受限，长内容会挤成一条、读起来累。新契约让模型返回
+    `segments` 数组，这里逐条发送；同时兼容旧契约（只有 text）和模型
+    不听话时用 ||| 分隔的写法。
+    """
+    segs = []
+    raw = (decision or {}).get("segments")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                item = item.get("text") or item.get("content") or ""
+            seg = sanitize_outgoing_text(item)
+            if seg:
+                segs.append(seg)
+    if not segs:
+        text = sanitize_outgoing_text((decision or {}).get("text"))
+        if text:
+            parts = [p for p in re.split(r"\s*\|\|\|\s*", text) if p.strip()]
+            segs = [sanitize_outgoing_text(p) for p in parts]
+            segs = [s for s in segs if s]
+    # 相邻重复去掉（模型偶尔一句话写两遍）
+    deduped = []
+    for seg in segs:
+        if deduped and seg == deduped[-1]:
+            continue
+        deduped.append(seg)
+    return deduped[:MAX_REPLY_SEGMENTS]
 
 
 def poll_agent_results(hwnd, rect=None, layout=None):
@@ -1192,7 +1503,8 @@ def poll_agent_results(hwnd, rect=None, layout=None):
                 AGENT_INFLIGHT.pop(target, None)
 
         action = str(decision.get("action") or "reply").lower()
-        text = str(decision.get("text") or "").strip()
+        segments = _decision_segments(decision)
+        text = " / ".join(segments)          # 仅用于日志展示
         urgency = str(decision.get("urgency") or "now").lower()
         reason = str(decision.get("reason") or "")
         cost = item.get("cost") or 0.0
@@ -1200,9 +1512,19 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         # 过期结果丢弃：该好友已提交过更新的任务，这条旧结论会答非所问
         with AGENT_LOCK:
             latest_job = AGENT_LATEST.get(target)
+            latest_pend = AGENT_PENDING.get(latest_job) if latest_job else None
         if latest_job and latest_job != job_id:
-            log(f"🗑️ [丢弃过期决策] 好友【{target}】已有更新消息在决策中，本轮结论作废")
-            continue
+            # 只有"更新的那条消息内容真的不一样"才作废本结论。
+            # 历史坑：原先只要存在更新的 job 就丢弃，当 agent 比主循环慢时，
+            # 每个结论落地时都已被下一次提交作废 → 永远不回复、日志刷屏。
+            newer_text = (latest_pend or {}).get("message")
+            this_text = item.get("message")
+            if newer_text is not None and this_text is not None and newer_text == this_text:
+                # 内容相同，只是签名抖动造成的重复提交：本结论依然有效，继续走发送
+                pass
+            else:
+                log(f"🗑️ [丢弃过期决策] 好友【{target}】已有更新消息在决策中，本轮结论作废")
+                continue
 
         if action == "ignore":
             LAST_PROCESSED_SIGNATURE[target] = signature
@@ -1212,14 +1534,14 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         if action == "defer":
             LAST_PROCESSED_SIGNATURE[target] = signature
             delay = client.urgency_to_seconds(urgency) if client else 60.0
-            if text:
-                _schedule_outbox(target, text, signature, delay, "defer")
+            if segments:
+                _schedule_outbox(target, segments, signature, delay, "defer")
             else:
                 log(f"⏸️ [Agent 判定稍后再说] 好友【{target}】: {reason}")
             continue
 
         # action == reply
-        if not text:
+        if not segments:
             log(f"⚠️ [Agent 空回复] 好友【{target}】无正文，跳过")
             LAST_PROCESSED_SIGNATURE[target] = signature
             continue
@@ -1227,11 +1549,11 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         delay = client.urgency_to_seconds(urgency) if client else 0.0
         if delay > 0:
             LAST_PROCESSED_SIGNATURE[target] = signature
-            _schedule_outbox(target, text, signature, delay, "agent")
+            _schedule_outbox(target, segments, signature, delay, "agent")
             continue
 
         log(f"💬 [Agent 决策] 好友【{target}】: {text}  (urgency={urgency}, 耗时 {cost:.1f}s)")
-        if _deliver_reply(target, text, signature, hwnd, rect, layout, cfg, source="agent"):
+        if _deliver_reply(target, segments, signature, hwnd, rect, layout, cfg, source="agent"):
             did_send = True
 
     # ---------- 2) 到点的延时队列 ----------
@@ -1247,7 +1569,8 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         if target in AGENT_INFLIGHT:
             log(f"🗑️ [撤销待发] 好友【{target}】有更新消息在决策中，丢弃旧计划")
             continue
-        if _deliver_reply(target, entry["text"], entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
+        pending_texts = entry.get("texts") or entry.get("text") or []
+        if _deliver_reply(target, pending_texts, entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
             did_send = True
 
     return did_send
@@ -1256,7 +1579,8 @@ def poll_agent_results(hwnd, rect=None, layout=None):
 def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layout, cfg):
     """线程池提交失败时的同步兜底：直接处理决策（会短暂阻塞主循环，仅在异常路径发生）。"""
     action = str((decision or {}).get("action") or "reply").lower()
-    text = str((decision or {}).get("text") or "").strip()
+    segments = _decision_segments(decision)
+    text = " / ".join(segments)          # 仅用于日志展示
     urgency = str((decision or {}).get("urgency") or "now").lower()
     reason = str((decision or {}).get("reason") or "")
 
@@ -1268,10 +1592,10 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
         LAST_PROCESSED_SIGNATURE[target] = signature
         client = get_agent_client(cfg)
         delay = client.urgency_to_seconds(urgency) if client else 60.0
-        if text:
-            _schedule_outbox(target, text, signature, delay, "defer-sync")
+        if segments:
+            _schedule_outbox(target, segments, signature, delay, "defer-sync")
         return False
-    if not text:
+    if not segments:
         LAST_PROCESSED_SIGNATURE[target] = signature
         return False
 
@@ -1279,11 +1603,11 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
     delay = client.urgency_to_seconds(urgency) if client else 0.0
     if delay > 0:
         LAST_PROCESSED_SIGNATURE[target] = signature
-        _schedule_outbox(target, text, signature, delay, "agent-sync")
+        _schedule_outbox(target, segments, signature, delay, "agent-sync")
         return False
 
     log(f"💬 [Agent 决策·同步] 好友【{target}】: {text}")
-    return _deliver_reply(target, text, signature, hwnd, rect, layout, cfg, source="agent-sync")
+    return _deliver_reply(target, segments, signature, hwnd, rect, layout, cfg, source="agent-sync")
 
 
 def count_green_bubble_metrics(img, layout):
@@ -1397,7 +1721,10 @@ def safe_clipboard_copy(text, retries=3, delay=0.03):
     """
     带冲突退避重试的剪贴板安全写入函数：
     有效化解 Windows 剪贴板历史 (Win+V)、杀软或浏览器占用导致的 OpenClipboard 冲突。
+    Linux 侧交给常驻 GTK 剪贴板守护（本机没有 xclip/xsel，pyperclip 用不了）。
     """
+    if IS_LINUX:
+        return bool(lx and lx.clipboard_copy(text))
     for i in range(retries):
         try:
             pyperclip.copy(text)
@@ -1406,6 +1733,23 @@ def safe_clipboard_copy(text, retries=3, delay=0.03):
             if i < retries - 1:
                 time.sleep(delay)
     return False
+
+def _ocr_call(img):
+    """统一 OCR 入口。
+
+    rapidocr 1.x 只吃 ndarray/bytes/路径，新版本不再接受 PIL.Image；
+    老版本（项目原本打包的）PIL 和 ndarray 都吃。统一转 ndarray 两边都安全。
+    """
+    if img is None:
+        return [], None
+    if not isinstance(img, np.ndarray):
+        img = np.asarray(img)
+    try:
+        return ocr_engine(img)
+    except Exception as e:
+        _warn_throttled("ocr_fail", f"\u26a0\ufe0f [OCR 失败] {e}")
+        return [], None
+
 
 def _scan_window(hwnd):
     """
@@ -1418,14 +1762,14 @@ def _scan_window(hwnd):
     W, H = img.size
     if W <= 100 or H <= 100:
         return None, None, None, None
-    layout = compute_wechat_layout(W, H)
+    layout = compute_wechat_layout(W, H, img)
     ratio = 1000.0 / W if W > 1100 else 1.0
     if ratio < 1.0:
         small = img.resize((int(W * ratio), int(H * ratio)), Image.Resampling.BILINEAR)
-        raw, _ = ocr_engine(small)
+        raw, _ = _ocr_call(small)
         res = [([[p[0] / ratio, p[1] / ratio] for p in b], t, s) for b, t, s in (raw or [])]
     else:
-        res, _ = ocr_engine(img)
+        res, _ = _ocr_call(img)
     return img, layout, res, extract_active_chat_title(res, layout)
 
 
@@ -1439,7 +1783,7 @@ def _sidebar_row_y(res, layout, target, H):
         if not (sidebar_w <= cx <= chat_start_x and (layout["header_h"] + 5) <= cy <= (H - 20)):
             continue
         t = str(txt).strip()
-        if is_group_chat_name(t):
+        if looks_like_group(t):
             continue
         if is_name_matched_strict(t, [target])[0]:
             return int(cy)
@@ -1502,7 +1846,12 @@ def find_contact(hwnd, target, cfg=None):
 
 
 def _key_combo(vk, ctrl=True):
-    """按一次组合键（默认带 Ctrl）。走真实键盘输入队列，兼容性最好。"""
+    """按一次组合键（默认带 Ctrl）。走真实键盘输入队列，兼容性最好。
+
+    vk 沿用 Windows 虚拟键码；Linux 侧由后端翻译成 keysym。
+    """
+    if IS_LINUX:
+        return bool(lx and lx.key(vk, ctrl=ctrl))
     try:
         if ctrl:
             user32.keybd_event(0x11, 0, 0, 0)
@@ -1600,6 +1949,8 @@ WECHAT_POPUP_CLASS = "Qt51514QWindowToolSaveBits"
 
 def _wechat_pid(hwnd):
     """取窗口所属进程 pid，失败返回 0。"""
+    if IS_LINUX:
+        return 0                     # Linux 侧按 WM_CLASS 找弹窗，不需要 pid
     try:
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -1616,7 +1967,12 @@ def _find_wechat_popup(main_hwnd, timeout=1.2):
     （class=Qt51514QWindowToolSaveBits，title=Weixin，约 644x707，
     位置在主窗左上方外侧），主窗口的 PrintWindow 位图里**完全没有它**。
     所以必须单独枚举出来抓图，否则永远只能看到没被过滤的会话列表。
+
+    Linux（4.1.26 实测）：同样是独立顶层窗（class 仍是 wechat，约 368x426，
+    位置落在主窗内部），按"除主窗之外面积最大的 wechat 窗"取。
     """
+    if IS_LINUX:
+        return lx.find_popup(main_hwnd, timeout=timeout) if lx else None
     pid = _wechat_pid(main_hwnd)
     if not pid:
         return None
@@ -1681,7 +2037,7 @@ def _locate_in_popup(popup, target):
         t = str(txt).strip()
         if not t or t in noise:
             continue
-        if is_group_chat_name(t):
+        if looks_like_group(t):
             continue
         if is_name_matched_strict(t, [target])[0]:
             hits.append((cy, cx, t))
@@ -1700,7 +2056,13 @@ def _real_click_client_point(hwnd, client_x, client_y):
     用「真实鼠标」点击窗口客户区坐标（会真的移动光标）。
 
     PostMessage 在弹出窗上不一定被 Qt 接受，这是兜底方案。
+    Linux 侧本来就只有"真实鼠标"这一条路。
     """
+    if IS_LINUX:
+        if lx:
+            lx.click_client(hwnd, client_x, client_y)
+            return True
+        return False
     try:
         dx, dy = _nonclient_offset(hwnd)
         pt = wintypes.POINT(int(client_x), int(client_y))
@@ -1716,6 +2078,96 @@ def _real_click_client_point(hwnd, client_x, client_y):
         return False
 
 
+
+# -----------------------------------------------------------------------------
+# Linux 版「搜索并打开会话」
+# -----------------------------------------------------------------------------
+def _linux_search_and_open(hwnd, target, search_key=None):
+    """Linux/X11 实现：先点侧栏已有行，再退回 Ctrl+F + 搜索弹出窗。
+
+    与 Windows 版的关键差异：
+      - 没有 PostMessage，点击一律走 XTest（会真的移动光标）
+      - 搜索结果是独立顶层窗（class 仍是 wechat），坐标按该窗自己的几何算
+      - 关键词一律走剪贴板粘贴：fcitx 会把逐键字符吞成候选词
+    """
+    key = str(search_key or target or "").strip() or target
+    old_clip = lx.clipboard_paste() if lx else ""
+    opened = False
+    if not activate_wechat(hwnd):
+        log("\U0001f6ab [搜索找人] 无法激活微信窗口，放弃")
+        return False
+    try:
+        # ① 侧栏已经有这个会话：直接点，最稳（不会弹搜一搜）
+        img, layout, res, _ = _scan_window(hwnd)
+        if img is None:
+            log("\U0001f6ab [搜索找人] 抓图失败")
+            return False
+        row = _sidebar_row_y(res, layout, target, img.size[1])
+        if row is not None:
+            click_x = int((layout["sidebar_w"] + layout["chat_start_x"]) / 2.0)
+            log(f"\U0001f3af [侧栏命中] 【{target}】(y={row})，点击进入")
+            post_click_client_point(hwnd, click_x, int(row))
+            time.sleep(0.70)
+            _, _, _, title = _scan_window(hwnd)
+            if title and is_name_matched_strict(title, [target])[0]:
+                opened = True
+                return True
+            log(f"   \u21b3 点完顶栏是【{title or '未知'}】，改走全局搜索")
+
+        # ② Ctrl+F 全局搜索
+        _key_combo(0x46)
+        time.sleep(0.50)
+        for attempt in range(1, 4):
+            activate_wechat(hwnd)
+            time.sleep(0.10)
+            _key_combo(0x41)                # Ctrl+A
+            time.sleep(0.05)
+            _key_combo(0x08, ctrl=False)    # Backspace 清空旧内容
+            time.sleep(0.05)
+            if not safe_clipboard_copy(key):
+                log("\U0001f6ab [搜索找人] 剪贴板写入失败，放弃")
+                return False
+            _key_combo(0x56)                # Ctrl+V
+            time.sleep(1.10)                # 等搜索结果渲染
+
+            popup = _find_wechat_popup(hwnd, timeout=1.5)
+            if not popup:
+                log(f"\u26a0\ufe0f [搜索找人] 第 {attempt}/3 次没等到搜索弹出窗")
+                continue
+            spot = _locate_in_popup(popup, target)
+            if not spot:
+                log(f"\u26a0\ufe0f [搜索找人] 第 {attempt}/3 次弹出窗里没有【{target}】")
+                continue
+
+            px, py = spot
+            log(f"\U0001f3af [搜索命中] 弹出窗内点击 ({px},{py}) 进入【{target}】")
+            post_click_client_point(popup, px, py)
+            time.sleep(0.85)
+
+            _, _, _, title = _scan_window(hwnd)
+            if title and is_name_matched_strict(title, [target])[0]:
+                opened = True
+                return True
+
+            log(f"   \u21b3 PostMessage 等价路径没生效（顶栏【{title or '未知'}】），改用真实鼠标重点一次")
+            _real_click_client_point(popup, px, py)
+            time.sleep(0.85)
+            _, _, _, title = _scan_window(hwnd)
+            if title and is_name_matched_strict(title, [target])[0]:
+                opened = True
+                return True
+            log(f"\U0001f6ab [搜索点击未生效] 顶栏为【{title or '未知'}】，放弃防串发")
+            return False
+        return False
+    finally:
+        if not opened:
+            _key_combo(0x1B, ctrl=False)
+            time.sleep(0.10)
+            ensure_wechat_visible(hwnd)
+        if old_clip:
+            safe_clipboard_copy(old_clip, retries=2, delay=0.02)
+
+
 def _search_and_open(hwnd, target, search_key=None):
     """
     在微信里搜索并点进【target】的聊天窗口。成功返回 True。
@@ -1724,6 +2176,9 @@ def _search_and_open(hwnd, target, search_key=None):
     `search_key` 是真正粘进搜索框的词（默认就用备注；微信 PC 端**不支持**
     用微信号搜索，实测搜 wxid 只会得到「网络查找微信号」的网页结果）。
     """
+    if IS_LINUX:
+        return _linux_search_and_open(hwnd, target, search_key)
+
     key = str(search_key or target or "").strip() or target
     old_clip = None
     try:
@@ -1828,7 +2283,7 @@ def _search_and_open(hwnd, target, search_key=None):
             t = str(txt).strip()
             if not t or t in noise:
                 continue
-            if is_group_chat_name(t):
+            if looks_like_group(t):
                 continue
             if is_name_matched_strict(t, [target])[0]:
                 candidates.append((cy, cx, t))
@@ -1912,11 +2367,17 @@ def _expire_pending():
         log(f"🗑️ [待确认过期] 清理了 {len(stale)} 条超过 {hours:g} 小时的待确认消息")
 
 
+_PENDING_ID_SEQ = [0]
+
+
 def _append_pending_confirm(target, text, source="api"):
     """需要人工确认时，把待发消息落到队列，等 GUI 弹窗点确认。"""
     _expire_pending()
+    # 毫秒时间戳做 id：同一毫秒内连发两条会撞 id，后一条把前一条顶掉
+    # （回归测试里就踩到过），加个进程内自增序号保证唯一。
+    _PENDING_ID_SEQ[0] += 1
     record = {
-        "id": f"p{int(time.time() * 1000)}",
+        "id": f"p{int(time.time() * 1000)}-{_PENDING_ID_SEQ[0]}",
         "target": target,
         "text": text,
         "source": source,
@@ -1975,6 +2436,102 @@ def reject_pending(pending_id, reason=""):
     return {"ok": True, "code": "ok", "detail": "已跳过"}
 
 
+
+# -----------------------------------------------------------------------------
+# Linux 版「即时发送」
+# -----------------------------------------------------------------------------
+def _linux_send_reply(hwnd, rect, layout, target, final_reply):
+    """Linux/X11 实现：核验顶栏 → 点输入框 → Ctrl+V → Enter → 绿底增量验收。
+
+    与 Windows 版的差异：
+      - 没有 GetForegroundWindow 的强校验，改用 X11 焦点查询（lx.activate 返回）
+      - PostMessage 换成 XTest（会移动光标）
+      - 验收判据复用同一套 verify_diff_bubble_success（纯图像处理，平台无关）
+    """
+    # --- 发送前核验：顶栏必须是目标会话，绝不盲发 ---
+    img_now, cur_rect, _ = grab_wechat_window(hwnd)
+    if img_now is None:
+        log("\u26a0\ufe0f [发送前核验失败] 无法获取微信画面，终止发送防误触")
+        return False
+    cur_W, cur_H = img_now.size
+    cur_layout = compute_wechat_layout(cur_W, cur_H, img_now)
+
+    _, _, res_now, cur_title = _scan_window(hwnd)
+    if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+        log(f"\u26a0\ufe0f [发送前纠偏] 当前顶栏【{cur_title or '未知'}】不是【{target}】，先切过去")
+        if not _linux_search_and_open(hwnd, target):
+            log(f"\U0001f6ab [发送中止] 无法锁定会话【{target}】")
+            return False
+        time.sleep(0.40)
+        img_now, cur_rect, _ = grab_wechat_window(hwnd)
+        if img_now is None:
+            return False
+        cur_W, cur_H = img_now.size
+        cur_layout = compute_wechat_layout(cur_W, cur_H, img_now)
+        _, _, _, cur_title = _scan_window(hwnd)
+        if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+            log(f"\U0001f6ab [发送中止] 切换后顶栏仍是【{cur_title or '未知'}】")
+            return False
+
+    log(f"\U0001f4e4 正在回复【{target}】: {final_reply}")
+    old_clip = lx.clipboard_paste() if lx else ""
+    send_success = False
+    send_unverified = False
+
+    for attempt in range(1, 3):
+        if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
+            log(f"\u26a0\ufe0f [剪贴板写入受阻(尝试 {attempt}/2)] 稍后重试...")
+            time.sleep(0.05)
+            continue
+
+        img_pre, _, _ = grab_wechat_window(hwnd)
+
+        # 击键前必须真的拿到键盘焦点，否则按键会串到别的窗口
+        if not activate_wechat(hwnd):
+            log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 微信没拿到键盘焦点，坚决终止按键防串窗")
+            time.sleep(0.15)
+            continue
+
+        # 点输入框（几何中心，避开底部图标栏与顶部分割线）
+        input_safe_x = int(0.55 * cur_W)
+        input_safe_y = int(cur_H - cur_layout["input_h"] * 0.55)
+        post_click_client_point(hwnd, input_safe_x, input_safe_y)
+        time.sleep(0.10)
+
+        if not activate_wechat(hwnd):
+            log(f"\U0001f6ab [安全熔断(尝试 {attempt}/2)] 点击后焦点脱失，终止击键")
+            continue
+
+        _key_combo(0x56)                 # Ctrl+V
+        time.sleep(0.18)
+        _key_combo(0x0D, ctrl=False)     # Enter 发送
+        time.sleep(0.55)
+
+        img_post, _, _ = grab_wechat_window(hwnd)
+        verdict = verify_diff_bubble_success(img_pre, img_post, cur_layout)
+        if verdict is True:
+            send_success = True
+            break
+        if verdict == "UNCERTAIN":
+            log(f"\u26a0\ufe0f [闭环验收异常] 画面无法比对，安全熔断终止重试以防给【{target}】重复发消息")
+            send_success = True
+            send_unverified = True
+            break
+        log(f"\u26a0\ufe0f [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新长出的绿底气泡，重试...")
+        time.sleep(0.20)
+
+    if old_clip:
+        safe_clipboard_copy(old_clip, retries=2, delay=0.02)
+
+    if send_success and send_unverified:
+        log(f"\u26a0\ufe0f [发送未验证] 已按发出处理并登记防重复，但未能抓图验证【{target}】是否收到")
+    elif send_success:
+        log(f"\u2705 [Linux 静默秒回成功] 已回复【{target}】")
+    else:
+        log(f"\u274c [发送脱靶告警] 2 次重试后均未检测到绿底气泡增量！")
+    return send_success
+
+
 def send_reply_instant(hwnd, rect, layout, target, final_reply):
     """
     极速秒回直达引擎（局部消息投递，0 弹窗 0 鼠标物理移动）：
@@ -1986,6 +2543,9 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
     6. 平稳切回用户原窗口 (彻底废除 HWND_BOTTOM 压底)
     7. 动态差分绿底增量严谨闭环验收
     """
+    if IS_LINUX:
+        return _linux_send_reply(hwnd, rect, layout, target, final_reply)
+
     # --- 发送前核验 (Pre-Flight Verification) ---
     img_now, cur_rect, cur_scale = grab_wechat_window(hwnd)
     if not img_now:
@@ -1993,20 +2553,20 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
         return False
         
     cur_W, cur_H = img_now.size
-    cur_layout = compute_wechat_layout(cur_W, cur_H)
+    cur_layout = compute_wechat_layout(cur_W, cur_H, img_now)
     
     # 极速轻量 OCR 顶栏与左侧列表
     target_w = 1000
     downscale_ratio = 1000.0 / cur_W if cur_W > 1100 else 1.0
     if downscale_ratio < 1.0:
         img_for_ocr = img_now.resize((target_w, int(cur_H * downscale_ratio)), Image.Resampling.BILINEAR)
-        res_raw, _ = ocr_engine(img_for_ocr)
+        res_raw, _ = _ocr_call(img_for_ocr)
         res_now = []
         for b, txt, sc in (res_raw or []):
             mapped_box = [[pt[0] / downscale_ratio, pt[1] / downscale_ratio] for pt in b]
             res_now.append((mapped_box, txt, sc))
     else:
-        res_now, _ = ocr_engine(img_now)
+        res_now, _ = _ocr_call(img_now)
         
     cur_title = extract_active_chat_title(res_now, cur_layout)
     is_right_target = is_name_matched_strict(cur_title, [target])[0] if cur_title else False
@@ -2034,9 +2594,9 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
                 log(f"🚫 [安全熔断] 纠偏后无法抓图复核顶栏，放弃本次发送防串发！")
                 return False
             chk_W, chk_H = img_chk.size
-            chk_layout = compute_wechat_layout(chk_W, chk_H)
+            chk_layout = compute_wechat_layout(chk_W, chk_H, img_chk)
             hdr = img_chk.crop((0, 0, chk_W, int(chk_layout["header_h"] + 15)))
-            res_hdr_raw, _ = ocr_engine(hdr)
+            res_hdr_raw, _ = _ocr_call(hdr)
             res_hdr = [([[pt[0], pt[1]] for pt in b], txt, sc) for b, txt, sc in (res_hdr_raw or [])]
             chk_title = extract_active_chat_title(res_hdr, chk_layout)
             if not (chk_title and is_name_matched_strict(chk_title, [target])[0]):
@@ -2159,7 +2719,7 @@ def scan_and_reply_wechat(hwnd):
     if W <= 100 or H <= 100:
         return
         
-    layout = compute_wechat_layout(W, H)
+    layout = compute_wechat_layout(W, H, img_wechat)
     arr_wechat = np.array(img_wechat)
     
     # -------------------------------------------------------------------------
@@ -2195,13 +2755,13 @@ def scan_and_reply_wechat(hwnd):
     if downscale_ratio < 1.0:
         target_h = int(H * downscale_ratio)
         img_for_ocr = img_wechat.resize((target_w, target_h), Image.Resampling.BILINEAR)
-        res_raw, _ = ocr_engine(img_for_ocr)
+        res_raw, _ = _ocr_call(img_for_ocr)
         res = []
         for b, txt, sc in (res_raw or []):
             mapped_box = [[pt[0] / downscale_ratio, pt[1] / downscale_ratio] for pt in b]
             res.append((mapped_box, txt, sc))
     else:
-        res, _ = ocr_engine(img_wechat)
+        res, _ = _ocr_call(img_wechat)
         
     if not res:
         return
@@ -2305,7 +2865,7 @@ def scan_and_reply_wechat(hwnd):
             pending_bubbles, combined_text = extract_pending_incoming_messages(chat_bubbles)
             # 🔥 第一道铁闸：只要当前好友有未回复新消息，绝对锁定在当前窗口就地秒回！
             if pending_bubbles and combined_text:
-                current_sig = (current_active_target, combined_text, int(pending_bubbles[-1]['last_y']), len(chat_bubbles))
+                current_sig = _msg_signature(current_active_target, combined_text, pending_bubbles)
                 if LAST_PROCESSED_SIGNATURE.get(current_active_target) != current_sig:
                     # 🔒 Agent 在飞/待发闸门：同一条消息已经在后台思考或排队待发，本轮直接放行，
                     #    绝不再重复提交（否则每个心跳都会重复问 agent，烧额度还会乱序）。
@@ -2325,7 +2885,7 @@ def scan_and_reply_wechat(hwnd):
                             img_settled, _, _ = grab_wechat_window(hwnd)
                             if img_settled:
                                 img_chat_crop_lat = img_settled.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-                                res_lat_raw, _ = ocr_engine(img_chat_crop_lat)
+                                res_lat_raw, _ = _ocr_call(img_chat_crop_lat)
                                 res_lat = []
                                 for b, txt, sc in (res_lat_raw or []):
                                     res_lat.append(([[pt[0] + crop_x1, pt[1] + crop_y1] for pt in b], txt, sc))
@@ -2334,7 +2894,7 @@ def scan_and_reply_wechat(hwnd):
                                 if pending_lat and combined_lat:
                                     pending_bubbles = pending_lat
                                     combined_text = combined_lat
-                                    current_sig = (current_active_target, combined_text, int(pending_bubbles[-1]['last_y']), len(chat_bubbles_lat))
+                                    current_sig = _msg_signature(current_active_target, combined_text, pending_bubbles)
                             
                     log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】新消息({len(pending_bubbles)}条): \"{combined_text}\"")
                     # ================= P0/P1: 交给 Agent 后台决策，主循环立刻返回继续巡检 =================
@@ -2537,7 +3097,7 @@ def proactive_send(target, text, cfg=None, source="api"):
     img, rect, _scale = grab_wechat_window(hwnd)
     if not img:
         return {"ok": False, "code": "grab_failed", "detail": "抓图失败", "sent": False, "queued": False}
-    layout = compute_wechat_layout(img.size[0], img.size[1])
+    layout = compute_wechat_layout(img.size[0], img.size[1], img)
 
     log(f"📮 [主动发送] 好友【{t}】: {body}")
     sent = send_reply_instant(hwnd, rect, layout, t, body)
@@ -2763,12 +3323,27 @@ def _proactive_http_handler():
                     "max_per_hour": ps.get("max_per_hour"),
                     "max_per_day": ps.get("max_per_day"),
                     "pending_confirm": len(list_pending()),
-                    "wechat_running": get_wechat_hwnd()[0] is not None,
+                    "wechat_running": WECHAT_HWND_CACHE[0] is not None,
                 })
             if path == "/pending":
                 return self._json(200, {"ok": True, "items": list_pending()})
             if path == "/contacts":
                 return self._json(200, {"ok": True, "contacts": load_contacts(load_config())})
+            if path in ("/sessions", "/contexts"):
+                cfg = load_config()
+                client = get_agent_client(cfg)
+                if client is None:
+                    return self._json(503, {"ok": False, "code": "agent_unavailable"})
+                items = []
+                for c in load_contacts(cfg):
+                    name = str((c or {}).get("remark") or "").strip()
+                    if not name:
+                        continue
+                    items.append({"target": name, "context": client.effective_context_id(name)})
+                return self._json(200, {"ok": True, "sessions": items})
+            if path == "/rotate":
+                return self._json(400, {"ok": False, "code": "use_post",
+                                        "detail": "请用 POST /rotate，body: {\"target\":\"老爸\"}"})
             return self._json(404, {"ok": False, "code": "not_found"})
 
         def do_POST(self):
@@ -2799,6 +3374,19 @@ def _proactive_http_handler():
             if path == "/reject":
                 result = reject_pending(body.get("id"), body.get("reason") or "")
                 return self._json(200 if result.get("ok") else 404, result)
+
+            if path == "/rotate":
+                target = str(body.get("target") or body.get("contact") or "").strip()
+                if not target:
+                    return self._json(400, {"ok": False, "code": "missing_field",
+                                            "detail": "需要 target（好友备注或微信号）"})
+                client = get_agent_client(load_config())
+                if client is None:
+                    return self._json(503, {"ok": False, "code": "agent_unavailable"})
+                base = client.context_id_for(target)
+                new_ctx = client.rotate_context_id(base)
+                log(f"🔄 [会话轮换] 好友【{target}】-> 新会话 {new_ctx}（下一条消息起生效）")
+                return self._json(200, {"ok": True, "target": target, "context": new_ctx})
 
             if path == "/contacts":
                 ok, detail = _contacts_api_update(body)
@@ -2887,6 +3475,7 @@ def main_loop():
     while True:
         try:
             hwnd, ver = get_wechat_hwnd()
+            WECHAT_HWND_CACHE[0] = hwnd
             if hwnd:
                 # ① 先取回后台 agent 的决策（到点的延时消息也在这里发出）
                 sent = poll_agent_results(hwnd)

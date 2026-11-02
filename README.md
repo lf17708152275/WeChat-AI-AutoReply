@@ -112,10 +112,6 @@ python wechat_ai_bot_dev.py
         "好友微信备注名A",
         "好友微信备注名B"
     ],
-    "friend_personas": {
-        "好友微信备注名A": "死党互损模式：说话幽默接地气、互怼开玩笑，绝不客套拘谨",
-        "默认": "真人好友模式：语气随和、口语化、真诚得体"
-    },
     "check_interval_seconds": 0.5
 }
 ```
@@ -183,19 +179,45 @@ curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" 
 }
 ```
 
+**按关系分流到不同 A2A 端点**（可选，配 `relation_urls`）：通讯录里给每个人填「关系」，bot 就会把消息发到该关系的专属端点；端点上的 agent preset 决定人格，所以「家人」「损友」可以完全是两种说话风格：
+
+```json
+{
+    "agent": {
+        "relation_urls": {
+            "家人": "http://192.168.31.20/a2a/relation-family",
+            "朋友": "http://192.168.31.20/a2a/relation-friend",
+            "损友": "http://192.168.31.20/a2a/relation-bro"
+        }
+    }
+}
+```
+
+- 优先级：`relation_urls[关系]` → `agent.url`（没填关系的人走默认端点）。
+- 首次给某个好友分流时日志会打一行 `🔀 [A2A 路由] 好友【老爸】→ 关系「家人」→ http://…`，方便核对。
+- **人格卡不在 bot 里**：bot 只负责 OCR/发送/桥接，人设由 DSH 微信端点的 `preset`（如 `card-22` 撩人精）提供，改卡不用重启 bot。
+
 Agent 返回的契约（一行 JSON）：
 
 ```json
-{"action": "reply|ignore|defer", "text": "回复内容", "urgency": "now|soon|later", "reason": "一句话理由"}
+{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "urgency": "now|soon|later", "reason": "一句话理由"}
 ```
 
-| action | 含义 | 机器人行为 |
-| --- | --- | --- |
-| `reply` | 该回 | 按 `urgency` 延迟后发送 |
-| `ignore` | 不用回（广告 / 晚安 / 单纯一个「嗯」） | 不发，但记下签名防止重复处理 |
-| `defer` | 该回但现在不合适 | 延后重试，超过 `max_defer_seconds` 放弃 |
+| 字段 | 含义 |
+| --- | --- |
+| `action` | `reply` 该回 / `ignore` 不用回 / `defer` 现在不合适 |
+| `segments` | 要**逐条连发**的消息数组（1–4 条，每条 5–30 字，像真人分条发）。只有一条时也可写 `"text": "..."`；老契约的 `text` 继续兼容，`text` 里用 `\|\|\|` 分隔也会被拆开 |
+| `urgency` | `now` 立即 / `soon` 30–90 秒 / `later` 3–15 分钟（带 ±20% 抖动） |
+| `reason` | 一句话理由，只用于日志 |
 
-- `urgency` → 延迟：`now` 立即 / `soon` 30–90 秒 / `later` 3–15 分钟（带 ±20% 抖动）。
+| action | 机器人行为 |
+| --- | --- |
+| `reply` | 按 `urgency` 延迟后逐条发送 `segments`（段间按字数停顿 0.5–1.5 秒，像真人在打字） |
+| `ignore` | 不发，但记下签名防止重复处理 |
+| `defer` | 整组消息进延时队列，超过 `max_defer_seconds` 放弃 |
+
+- **为什么分条**：DSH 单次回复有长度限制，长段落挤成一条既难看又容易被截断。让模型输出 `segments` 数组，bot 逐条发出去，阅读节奏跟真人连发一致。
+- 段间停顿可用 `segment_delay_min_seconds` / `segment_delay_span_seconds` 调（默认 0.45 / 0.9，另加 0–0.35 秒随机抖动）。
 - **Agent 不可用时**：记 ERROR 日志 + 发一条 `fallback_replies` 里的固定可爱回复，不会静默，也不会退回旧的直连模型。
 - **并发**：每个联系人一个 `contextId`，多线程并行决策，互不阻塞。
 - `contextId` 只允许 ASCII，中文昵称会自动哈希成 `wx-u<sha1前12位>`，映射表落在 `wechat_agent_contexts.json`。
@@ -298,6 +320,7 @@ python 回归测试_Agent大脑.py     # Agent 客户端、契约解析、降级
 python 回归测试_主动发送.py      # 主动发送护栏、HTTP 接口、找人三级策略
 python 回归测试_待确认队列.py    # 待确认队列落盘/恢复/确认/拒绝/过期
 python 回归测试_待确认GUI.py     # GUI 侧队列读写与接口对齐
+python 回归测试_GUI配置面板.py   # GUI 配置面板控件与保存逻辑
 ```
 
 联调（需要 DSH 的 A2A 服务在跑）：

@@ -90,7 +90,7 @@ CFG = {
 bot.get_wechat_hwnd = lambda: (1, 4)
 bot.find_contact = lambda hwnd, target, cfg=None: True
 bot.grab_wechat_window = lambda hwnd: (_FakeImg(), (0, 0, 1100, 750), 1.0)
-bot.compute_wechat_layout = lambda W, H: {
+bot.compute_wechat_layout = lambda W, H, img=None: {
     "sidebar_w": 60, "chat_start_x": 320, "header_h": 85,
     "input_h": 150, "total_w_px": W, "total_h_px": H,
 }

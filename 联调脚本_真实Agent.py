@@ -94,10 +94,6 @@ REAL_CFG = {
     },
     "reply_delay_seconds": 0.0,
     "include_prefix": False,
-    "friend_personas": {
-        "老同学B": "知心朋友模式：语气温柔活泼、偶尔俏皮、关心对方、真诚幽默",
-        "好兄弟A": "死党互损模式：说话幽默随和、接地气、开玩笑、互怼互损",
-    },
 }
 bot.load_config = lambda: REAL_CFG
 

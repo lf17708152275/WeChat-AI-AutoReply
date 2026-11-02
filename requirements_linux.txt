@@ -1,0 +1,16 @@
+> Linux 侧依赖清单（Windows 用 requirements.txt）。本机无 sudo，全部装到用户目录。
+>
+> 安装示例：
+>   python3 -m pip install --user -r requirements_linux.txt
+
+rapidocr_onnxruntime>=1.3.0
+Pillow>=9.0.0
+requests>=2.28.0
+numpy>=1.21.0
+python-xlib>=0.33
+
+# 说明：
+#  * pyperclip 在 Linux 上不需要（代码里已 try/except 降级），剪贴板走 wechat_linux_io 的 GTK 守护进程
+#  * psutil 仅 GUI 用（Linux 侧 fast_process_names 直接读 /proc，psutil 只是兜底）
+#  * tkinter 不是 pip 包：系统没装 python3-tk 时，用 apt-get download + dpkg-deb -x 解到 ~/.local/tkroot，
+#    start_linux.sh 会自动补 PYTHONPATH / LD_LIBRARY_PATH / TCL_LIBRARY / TK_LIBRARY

@@ -60,17 +60,19 @@ Thumbs.db
 
 # Local notes & documentation
 口述文案*.md
-
-# One-off probe scripts & screenshots (development artifacts)
-_probe*.py
-_probe*.log
-_start_gui.py
-_launch_gui.py
+# ---- Linux 开发期本地产物（不该入库）----
+# 临时探针/调试脚本
+_probe_*.py
+_fix_*.py
+_kill_*.py
+_launch_*.py
+_patch_*.py
 _restart_wx.py
-_patch_gui_test.py
-_fix_gui_test.py
-_shrink_roadmap.py
-_*.png
-
-# Local python packages installed via pip --target
+_start_gui.py
+# 运行期状态文件
+wechat_agent_context_rot.json
+wechat_agent_context_map.json
+bot_stdout.log
+# 本地静默安装的 Windows 二进制 / 旧版驱动
 .pylibs/
+linux_wechat_driver.py

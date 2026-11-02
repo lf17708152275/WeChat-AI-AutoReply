@@ -55,18 +55,92 @@ DEFAULT_FALLBACK_REPLIES = [
 
 CONTRACT = """你是微信自动回复代理，代替账号主人回复好友消息。
 只输出一行 JSON，不要 markdown 代码块，不要解释，不要任何多余文字：
-{"action":"reply|ignore|defer","text":"回复内容","urgency":"now|soon|later","reason":"一句话理由"}
+{"action":"reply|ignore|defer","segments":["第一条","第二条"],"urgency":"now|soon|later","reason":"一句话理由"}
 规则：
-- action=reply：正常回复，text 写要发出去的那句话
+- action=reply：正常回复。segments 是要**连发的 1-3 条消息**，按顺序一条条发出去，像真人连发
+  · 每条 5-30 个汉字，一条只说一件事；想说的多就分条，别把一大段挤进一条
+  · 只有一条时可以只写 "text":"..."；多段必须用 "segments"（不要用 ||| 之类的分隔符）
 - action=ignore：不需要回复。**以下情况一律 ignore**：
   · 广告、砍价链接、群发拉人头、系统消息
   · 对方说「晚安 / 我先睡了 / 先这样 / 不聊了 / 改天再说 / 拜拜」这类收尾话
   · 对方只是点赞、发个表情、发个「嗯/哦/好」，没有实际内容
   · 纯通知类（「我到楼下了」自己知道就行，除非明显在等你回应）
-- action=defer：该回但现在不合适（对方在忙、话题需要停顿）
+- action=defer：该回但现在不合适（对方在忙、话题需要停顿）；segments 照常写，到点再发
 - urgency=now 立即发；soon 30-90 秒后发；later 3-15 分钟后发
-- text 只写要发出去的话：不要加引号、不要加说明、不要带 [AI] 之类前缀
+- segments/text 只写要发出去的话：不要加引号、不要加说明、不要带 [AI] 之类前缀、不要带序号
+- 不要用书面连接词（首先/其次/此外/总之）、不要列点、不要括号写动作、不要句末客套
 - 严禁透露自己是 AI 或机器人"""
+
+# 一次回复最多拆几条：太多会像刷屏，真人连发 1-3 条最自然，留 4 的余量
+MAX_SEGMENTS = 4
+SEGMENT_SPLIT_RE = re.compile(r"\s*\|\|\|\s*")
+
+
+def decision_segments(obj):
+    """
+    把模型输出归一成「要逐条连发的消息列表」。
+
+    优先读 `segments` 数组（新契约）；兼容三种旧/坏输出：
+      · 只有 `text` 字符串
+      · `text` 里用 ||| 分隔多段（模型不听话时）
+      · segments 里混了 {"text": ...} 对象
+    """
+    if not isinstance(obj, dict):
+        return []
+    segs = []
+    raw = obj.get("segments")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                item = item.get("text") or item.get("content") or ""
+            seg = _clean_text(item)
+            if seg:
+                segs.append(seg)
+    if not segs:
+        text = _clean_text(obj.get("text") or "")
+        if text:
+            parts = [p for p in SEGMENT_SPLIT_RE.split(text) if p.strip()]
+            segs = [_clean_text(p) for p in parts]
+            segs = [s for s in segs if s]
+    # 去重相邻重复（模型偶尔把同一句写两遍）
+    deduped = []
+    for seg in segs:
+        if deduped and seg == deduped[-1]:
+            continue
+        deduped.append(seg)
+    return deduped[:MAX_SEGMENTS]
+
+# DSH A2A 执行器的"会话已存在"错误：本应 resume，但上游正则漏了 "already exists"，
+# 于是把错误原文当成回复文本返回。这里做客户端自愈：换一个新的 contextId 重试。
+# 目前见过的变体：
+#   session "a2a-wx-x" already exists
+#   session "a2a-wx2-x" is already owned by an active write handle
+SESSION_CONFLICT_RE = re.compile(r"already\s+(?:exists|has|owns|owned)|会话已存在", re.I)
+ROT_SUFFIX_RE = re.compile(r"-r\d+$")
+
+# DSH 的 ArchivedSessionGate 会拒绝"已归档会话"的每一步（turn/end reason=blocked），
+# 于是 agent 不产出任何文本，插件只回 "The agent completed without visible output."。
+# 同一个 contextId 再重试永远是空，只能轮换到新会话（自愈）。
+EMPTY_OUTPUT_RE = re.compile(r"without\s+visible\s+output|no[-\s]visible[-\s]output", re.I)
+# DSH 重启后会"恢复"上次没干净收尾的会话（给它开一个写句柄做修复），
+# 但这个句柄不会释放 —— 之后任何再打开同一会话的请求都会得到
+# "session ... is already owned by an active write handle"。
+# 这种会话救不回来，只能换新会话（-rN）继续聊。
+SESSION_OWNED_RE = re.compile(r"already\s+owned\s+by\s+an\s+active\s+write\s+handle", re.I)
+
+def _join_parts(parts):
+    """A2A 的 parts 可能是逐字 chunk，拼成一段完整文本。"""
+    if not parts:
+        return ""
+    buf = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("kind") not in (None, "text"):
+            continue
+        buf.append(str(part.get("text") or ""))
+    return "".join(buf).strip()
+
 
 ACTION_SET = {"reply", "ignore", "defer"}
 URGENCY_SET = {"now", "soon", "later"}
@@ -150,6 +224,12 @@ class AgentClient(object):
         self.url = str(agent_cfg.get("url") or DEFAULT_URL).strip()
         self.card_url = str(agent_cfg.get("card_url") or "").strip() or self._derive_card_url(self.url)
         self.context_prefix = str(agent_cfg.get("context_prefix") or "wx-")
+        # 关系 → 独立 A2A 端点（@hanphone/dsh-a2a 每个端点绑一个 preset）
+        self.relation_urls = agent_cfg.get("relation_urls") or {}
+        if not isinstance(self.relation_urls, dict):
+            self.relation_urls = {}
+        self._cfg = cfg
+        self._active_url = ""
         self.timeout = float(agent_cfg.get("timeout_seconds") or 180)
         self.connect_timeout = float(agent_cfg.get("connect_timeout_seconds") or 5)
         self.retries = max(0, int(agent_cfg.get("retries", 1)))
@@ -165,6 +245,16 @@ class AgentClient(object):
         self.logger = None          # 由主程序注入 log()，默认 print
         self.last_error = None
         self._mapping_path = agent_cfg.get("context_map_file")
+        # contextId 轮换表（会话冲突自愈用），默认跟映射表放同一个目录
+        rot_file = str(agent_cfg.get("context_rot_file") or "").strip()
+        if not rot_file:
+            if self._mapping_path:
+                rot_file = os.path.join(os.path.dirname(os.path.abspath(self._mapping_path)),
+                                        "wechat_agent_context_rot.json")
+            else:
+                rot_file = "wechat_agent_context_rot.json"
+        self._rot_path = rot_file
+        self._rotations = None      # 懒加载 {base_ctx: 当前轮换号}
 
     # ------------------------------------------------------------------ 配置
     @staticmethod
@@ -226,6 +316,52 @@ class AgentClient(object):
         except Exception:
             pass
 
+    # ---------------------------------------------------- contextId 冲突自愈
+    def _load_rotations(self):
+        if self._rotations is not None:
+            return self._rotations
+        data = {}
+        try:
+            if self._rot_path and os.path.exists(self._rot_path):
+                with open(self._rot_path, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                if isinstance(obj, dict):
+                    data = {str(k): int(v) for k, v in obj.items() if str(v).isdigit()}
+        except Exception:
+            data = {}
+        self._rotations = data
+        return data
+
+    def _save_rotations(self):
+        if not self._rot_path:
+            return
+        try:
+            d = os.path.dirname(os.path.abspath(self._rot_path))
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(self._rot_path, "w", encoding="utf-8") as f:
+                json.dump(self._load_rotations(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _apply_rotation(self, context_id):
+        """如果这个 contextId 之前自愈过，直接用最新的那个。"""
+        ctx = str(context_id or "")
+        n = self._load_rotations().get(ctx, 0)
+        return f"{ctx}-r{n}" if n > 0 else ctx
+
+    def effective_context_id(self, sender):
+        """这个人下次发消息实际会用的 contextId（已带上自愈轮换号）。"""
+        return self._apply_rotation(self.context_id_for(sender))
+
+    def rotate_context_id(self, context_id):
+        """把 contextId 轮换到下一个可用版本（-r2、-r3…），并落盘记住。"""
+        ctx = ROT_SUFFIX_RE.sub("", str(context_id or ""))
+        rot = self._load_rotations()
+        rot[ctx] = rot.get(ctx, 1) + 1
+        self._save_rotations()
+        return f"{ctx}-r{rot[ctx]}"
+
     def _log(self, msg):
         fn = self.logger
         if fn is None:
@@ -250,8 +386,38 @@ class AgentClient(object):
         except Exception:
             return False
 
+    # ------------------------------------------------------------------ 端点选择
+    def relation_of(self, target=""):
+        """这个联系人在配置里的关系分组（家人/朋友/同事…），没填返回空串。
+
+        只读 contacts 的 relation 字段——人格卡已经搬到 DSH preset 侧，
+        这里只决定"消息该发到哪个 A2A 关系端点"。
+        """
+        if not target:
+            return ""
+        try:
+            import persona_cards as _pc
+            return _pc.relation_of(self._cfg, target) or ""
+        except Exception:
+            return ""
+
+    def url_for(self, target=""):
+        """按联系人关系挑 A2A 端点；没配映射就用默认 url。"""
+        if not self.relation_urls:
+            return self.url
+        rel = self.relation_of(target)
+        picked = str(self.relation_urls.get(rel) or "").strip()
+        if not picked and rel:
+            warned = getattr(self, "_unmapped_relations", None)
+            if warned is None:
+                warned = self._unmapped_relations = set()
+            if rel not in warned:
+                warned.add(rel)
+                print(f"⚠️ [A2A 路由] 关系「{rel}」没有配置专属端点，回落到默认 {self.url}", flush=True)
+        return picked or self.url
+
     # ------------------------------------------------------------------ 主入口
-    def ask(self, context_id, prompt, timeout=None):
+    def ask(self, context_id, prompt, timeout=None, target=""):
         """问 agent 要一个决策。永远返回合法 dict，绝不抛异常。"""
         if not self.enabled:
             return self._fallback("agent_disabled")
@@ -260,13 +426,17 @@ class AgentClient(object):
 
         # 防御：调用方直接传了中文 contextId（DSH 建会话会失败，永远回 (no reply)）
         context_id = self._sanitize_context_id(context_id)
+        # 之前自愈过的会话：直接用轮换后的 id，避免每次都先撞一次墙
+        context_id = self._apply_rotation(context_id)
 
         timeout = timeout or self.timeout
+        url = self.url_for(target)
         raw = None
         last_err = None
 
         for attempt in range(self.retries + 1):
             try:
+                self._active_url = url
                 raw = self._send(context_id, prompt, timeout)
                 break
             except Exception as exc:
@@ -275,7 +445,67 @@ class AgentClient(object):
                     time.sleep(0.8)
 
         if raw is None:
-            return self._fallback(f"transport_error: {last_err}")
+            err_text = str(last_err or "")
+            # 会话被占用（DSH 重启后遗留的写句柄）走的是"任务失败"而不是正常文本，
+            # 所以必须在 transport 兜底之前先自愈，否则永远只能回可爱兜底。
+            if SESSION_OWNED_RE.search(err_text):
+                new_ctx = self.rotate_context_id(context_id)
+                self._log(f"♻️ [会话被占用自愈] {context_id} 写句柄未释放，改用新会话 {new_ctx} 重试")
+                try:
+                    self._active_url = url
+                    raw2 = self._send(new_ctx, prompt, timeout)
+                except Exception as exc:
+                    raw2 = None
+                    last_err = exc
+                if raw2:
+                    context_id, raw = new_ctx, raw2
+            if raw is None:
+                return self._fallback(f"transport_error: {last_err}")
+
+        # ---- 会话冲突自愈：DSH 把 "session ... already exists" 当成回复文本返回 ----
+        if SESSION_CONFLICT_RE.search(str(raw)) and self.retries >= 0:
+            new_ctx = self.rotate_context_id(context_id)
+            self._log(f"♻️ [会话冲突自愈] {context_id} 已存在，改用新会话 {new_ctx} 重试")
+            try:
+                self._active_url = url
+                raw2 = self._send(new_ctx, prompt, timeout)
+            except Exception as exc:
+                raw2 = None
+                last_err = exc
+            if raw2 and not SESSION_CONFLICT_RE.search(str(raw2)):
+                context_id, raw = new_ctx, raw2
+            else:
+                return self._fallback(f"session_conflict: {str(raw)[:120]!r}")
+
+        # ---- 空输出自愈：会话被归档/恢复失败时 turn 被静默 block，只有换新会话 ----
+        if EMPTY_OUTPUT_RE.search(str(raw)):
+            new_ctx = self.rotate_context_id(context_id)
+            self._log(f"♻️ [空输出自愈] {context_id} 未产出内容，改用新会话 {new_ctx} 重试")
+            try:
+                self._active_url = url
+                raw2 = self._send(new_ctx, prompt, timeout)
+            except Exception as exc:
+                raw2 = None
+                last_err = exc
+            if raw2 and not EMPTY_OUTPUT_RE.search(str(raw2)):
+                context_id, raw = new_ctx, raw2
+            else:
+                return self._fallback(f"empty_output: {str(raw)[:120]!r}")
+
+        # ---- 会话被占用自愈：DSH 重启后的恢复句柄不会释放，只能换新会话 ----
+        if SESSION_OWNED_RE.search(str(raw)):
+            new_ctx = self.rotate_context_id(context_id)
+            self._log(f"♻️ [会话被占用自愈] {context_id} 写句柄未释放，改用新会话 {new_ctx} 重试")
+            try:
+                self._active_url = url
+                raw2 = self._send(new_ctx, prompt, timeout)
+            except Exception as exc:
+                raw2 = None
+                last_err = exc
+            if raw2 and not SESSION_OWNED_RE.search(str(raw2)):
+                context_id, raw = new_ctx, raw2
+            else:
+                return self._fallback(f"session_owned: {str(raw)[:120]!r}")
 
         decision = self._parse(raw)
         if decision is None:
@@ -302,7 +532,7 @@ class AgentClient(object):
             },
         }
         resp = requests.post(
-            self.url,
+            getattr(self, "_active_url", "") or self.url,
             json=payload,
             timeout=(self.connect_timeout, timeout),
         )
@@ -326,22 +556,41 @@ class AgentClient(object):
     @staticmethod
     def _extract_text(body):
         result = (body or {}).get("result") or {}
+        # 有的实现直接返回字符串
+        if isinstance(result, str):
+            return result.strip()
+        if not isinstance(result, dict):
+            return ""
         task = result.get("task") or {}
+        if not isinstance(task, dict):
+            task = {}
 
-        state = str((task.get("status") or {}).get("state") or "")
+        status = task.get("status") or {}
+        state = str(status.get("state") or "")
         if state in ("TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"):
-            raise RuntimeError(f"任务未成功: {state}")
+            # 失败原因常常只在 status.message 里（例如 DSH 的
+            # "session ... is already owned by an active write handle"），
+            # 不带上去上层就无法自愈，只能一律当网络错误。
+            detail = _join_parts((status.get("message") or {}).get("parts"))
+            suffix = f" ({detail[:200]})" if detail else ""
+            raise RuntimeError(f"任务未成功: {state}{suffix}")
 
-        # 1) artifacts 里是最终产物，取最后一个非空 part
+        # 1) artifacts 里是最终产物。
+        #    注意：@hanphone/dsh-a2a 会把文本切成逐字 chunk（"我","这边","没有"…），
+        #    所以必须把同一个 artifact 的所有 part 拼起来，不能只取最后一个。
         for art in reversed(task.get("artifacts") or []):
-            for part in reversed(art.get("parts") or []):
-                t = str(part.get("text") or "").strip()
-                if t:
-                    return t
+            joined = _join_parts(art.get("parts"))
+            if joined:
+                return joined
 
         # 2) 兜底：status.message
-        for part in reversed((task.get("status") or {}).get("message", {}).get("parts") or []):
-            t = str(part.get("text") or "").strip()
+        joined = _join_parts((task.get("status") or {}).get("message", {}).get("parts"))
+        if joined:
+            return joined
+
+        # 3) 老插件（@ryubyte）可能直接把文本放在 result 上
+        for key in ("text", "message", "content", "output"):
+            t = str(result.get(key) or "").strip()
             if t:
                 return t
         return ""
@@ -360,13 +609,14 @@ class AgentClient(object):
             return None
 
         action = str(obj.get("action") or "").strip().lower()
-        out_text = _clean_text(obj.get("text") or "")
+        segments = decision_segments(obj)
+        out_text = "\n".join(segments)
 
         if action not in ACTION_SET:
             # 模型忘了给 action：有正文就当 reply，没正文就当 ignore
-            action = "reply" if out_text else "ignore"
+            action = "reply" if segments else "ignore"
 
-        if action == "reply" and not out_text:
+        if action == "reply" and not segments:
             # 说要回却没内容 —— 视为坏输出，走降级兜底
             return None
         urgency = str(obj.get("urgency") or "").strip().lower()
@@ -377,6 +627,7 @@ class AgentClient(object):
         return {
             "action": action,
             "text": out_text,
+            "segments": segments,
             "urgency": urgency,
             "reason": reason,
         }
@@ -389,6 +640,7 @@ class AgentClient(object):
         return {
             "action": "reply",
             "text": text,
+            "segments": [text],
             "urgency": "now",
             "reason": "agent_unavailable",
         }

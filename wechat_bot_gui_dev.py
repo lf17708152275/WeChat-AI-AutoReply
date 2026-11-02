@@ -11,9 +11,22 @@ import urllib.request
 import psutil
 import requests
 import ctypes
-from ctypes import wintypes
+
+# Linux 适配：Win32 依赖在 Linux 上缺失，降级为可选
+IS_WIN = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+if IS_WIN:
+    from ctypes import wintypes
+else:
+    wintypes = None
+    try:
+        import wechat_linux_io as lx
+    except Exception as _lx_err:
+        lx = None
+        _LX_IMPORT_ERR = _lx_err
+
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 # Force UTF-8 stdout
 if hasattr(sys.stdout, 'reconfigure'):
@@ -26,6 +39,8 @@ else:
 
 CONFIG_FILE = os.path.join(WORKSPACE_DIR, "wechat_config_dev.json")
 LOG_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.log")
+# 守护进程若由 systemd user unit 托管（推荐），启停必须走 systemctl，避免再拉起第二份进程
+SYSTEMD_BOT_UNIT_FILE = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", "wechat-bot.service")
 PID_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.pid")
 BOT_SCRIPT = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.py")
 
@@ -35,6 +50,8 @@ _K32 = None
 def _kernel32():
     """带完整原型的 kernel32，避免 64 位句柄被 ctypes 默认 c_int 截断。"""
     global _K32
+    if not IS_WIN:
+        return None          # Linux 侧不用 OpenProcess/QueryFullProcessImageNameW
     if _K32 is None:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.OpenProcess.restype = ctypes.c_void_p
@@ -57,6 +74,22 @@ def fast_process_names():
     QueryFullProcessImageNameW 只要 **0.04 秒**（实测快 100 倍）。
     取不到名字的（系统保护进程）直接跳过，它们不可能是我们的 python 守护。
     """
+    if IS_LINUX:
+        # Linux：/proc/<pid>/comm 比 psutil 快一个数量级，语义与 Windows 侧一致
+        out = {}
+        try:
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{d}/comm", "r", encoding="utf-8", errors="ignore") as f:
+                        out[int(d)] = f.read().strip()
+                except Exception:
+                    continue
+        except Exception:
+            return out
+        return out
+
     names = {}
     try:
         arr = (ctypes.c_ulong * 8192)()
@@ -94,23 +127,37 @@ def fast_process_names():
 KILL_SCRIPT = os.path.join(WORKSPACE_DIR, "kill_wechat_bot_dev.py")
 PENDING_FILE = os.path.join(WORKSPACE_DIR, "pending_confirm.jsonl")
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+if IS_WIN:
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
 
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
-
-class WINDOWPLACEMENT(ctypes.Structure):
-    _fields_ = [
-        ("length", wintypes.UINT),
-        ("flags", wintypes.UINT),
-        ("showCmd", wintypes.UINT),
-        ("ptMinPosition", wintypes.POINT),
-        ("ptMaxPosition", wintypes.POINT),
-        ("rcNormalPosition", wintypes.RECT)
-    ]
+    class WINDOWPLACEMENT(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.UINT),
+            ("flags", wintypes.UINT),
+            ("showCmd", wintypes.UINT),
+            ("ptMinPosition", wintypes.POINT),
+            ("ptMaxPosition", wintypes.POINT),
+            ("rcNormalPosition", wintypes.RECT)
+        ]
+else:
+    user32 = kernel32 = None
+    WNDENUMPROC = None
+    WINDOWPLACEMENT = None
 
 def get_wechat_normal_rect(hwnd):
     """获取微信在正常桌面状态下的坐标与长宽 (即便当前最小化或离屏也能准确提取)"""
+    if IS_LINUX:
+        if not (lx and hwnd):
+            return None
+        try:
+            r = lx.window_rect(hwnd)
+            if r.width >= 400 and r.height >= 300:
+                return [int(r.left), int(r.top), int(r.width), int(r.height)]
+        except Exception:
+            pass
+        return None
     try:
         wp = WINDOWPLACEMENT()
         wp.length = ctypes.sizeof(WINDOWPLACEMENT)
@@ -134,6 +181,8 @@ def get_wechat_normal_rect(hwnd):
     return None
 
 def ensure_default_desktop():
+    if IS_LINUX:
+        return
     try:
         h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
         if h_desk:
@@ -143,6 +192,10 @@ def ensure_default_desktop():
         pass
 
 def get_wechat_hwnd():
+    if IS_LINUX:
+        if lx is None:
+            return None, None
+        return lx.find_wechat_window()
     ensure_default_desktop()
     candidates = []
     def enum_proc(hwnd, lp):
@@ -196,8 +249,8 @@ class WeChatBotGUI(tk.Tk):
         self._after_ids = []
         self._closing = False
         self.title("微信AI自动回复")
-        self.geometry("1320x880")
-        self.minsize(1180, 760)
+        self.geometry("1320x920")
+        self.minsize(1180, 800)
         
         ico_file = os.path.join(WORKSPACE_DIR, "wechat_sky_blue_unread_ai_v4.ico")
         if os.path.exists(ico_file):
@@ -209,6 +262,11 @@ class WeChatBotGUI(tk.Tk):
         self.style = ttk.Style(self)
         try:
             self.style.theme_use("vista")
+        except Exception:
+            pass
+        # Linux 下中文字体行高常被压扁，固定 24px 让表格里的中文不再被上下裁掉
+        try:
+            self.style.configure("Treeview", rowheight=24)
         except Exception:
             pass
 
@@ -403,12 +461,16 @@ class WeChatBotGUI(tk.Tk):
         self.btn_restart = ttk.Button(btn_box, text="🔄 重启服务", command=self.restart_bot)
         self.btn_restart.pack(side=tk.LEFT, padx=4)
 
-        # 2. Main Notebook (Tabs)
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        # 2. 主区域：上方 Notebook + 下方实时日志（可拖动分隔条，日志永远不会被挤没）
+        self.main_pane = ttk.Panedwindow(self, orient=tk.VERTICAL)
+        self.main_pane.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        self.notebook = ttk.Notebook(self.main_pane)
+        self.main_pane.add(self.notebook, weight=3)
 
         self.tab_engine = ttk.Frame(self.notebook, padding=12)
         self.tab_prompt = ttk.Frame(self.notebook, padding=12)
+        self.tab_routes = ttk.Frame(self.notebook, padding=12)
         self.tab_contacts = ttk.Frame(self.notebook, padding=12)
         self.tab_whitelist = ttk.Frame(self.notebook, padding=12)
         self.tab_agent = ttk.Frame(self.notebook, padding=12)
@@ -418,30 +480,66 @@ class WeChatBotGUI(tk.Tk):
         self.notebook.add(self.tab_prompt, text=" 🎭 人设与指令 Prompt ")
         self.notebook.add(self.tab_whitelist, text=" 🌓 白名单与防扰 ")
         self.notebook.add(self.tab_test, text=" 🧪 AI 仿真测试沙盒 ")
+        self.notebook.add(self.tab_routes, text=" 🔀 A2A 关系路由 ")
         self.notebook.add(self.tab_contacts, text=" 📇 通讯录映射 ")
         self.notebook.add(self.tab_agent, text=" 🤖 大脑 / 主动发送 ")
 
         self.build_tab_engine()
         self.build_tab_prompt()
+        self.build_tab_routes()
         self.build_tab_contacts()
         self.build_tab_whitelist()
         self.build_tab_agent()
         self.build_tab_test()
 
-        # Bottom Log Viewer
-        log_frame = ttk.LabelFrame(self, text=" 📜 实时运行日志 (Auto-Scroll) ", padding=(10, 6))
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
+        # Bottom Log Viewer —— 实时监听 wechat_bot_dev.log
+        log_frame = ttk.LabelFrame(self.main_pane, text=" 📜 实时运行日志（自动跟随） ", padding=(10, 6))
+        self.main_pane.add(log_frame, weight=1)
+
+        self.var_log_follow = tk.BooleanVar(value=True)
+        self.var_log_pause = tk.BooleanVar(value=False)
+        self._log_buffer = []          # 最近日志行，供筛选重绘
+        self._log_filter = ""
+        self._log_mode = "全部"
+        self._log_total = 0
 
         log_ctrl_bar = ttk.Frame(log_frame)
         log_ctrl_bar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(log_ctrl_bar, text="实时日志流 (记录未读红点、好友消息、AI回复详情):", font=("微软雅黑", 8)).pack(side=tk.LEFT)
-        
-        ttk.Button(log_ctrl_bar, text="清空日志", command=self.clear_logs).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(log_ctrl_bar, text="打开日志文件", command=self.open_log_file).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(log_ctrl_bar, text="📌 生成桌面快捷方式", command=self.create_desktop_shortcut).pack(side=tk.RIGHT, padx=4)
+        ttk.Label(log_ctrl_bar, text="实时日志流（未读红点 / 收到消息 / A2A 路由 / AI 回复）:",
+                  font=("微软雅黑", 8)).pack(side=tk.LEFT)
+        ttk.Button(log_ctrl_bar, text="📂 打开日志文件", command=self.open_log_file).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(log_ctrl_bar, text="🧹 清空", command=self.clear_logs).pack(side=tk.RIGHT, padx=2)
 
-        self.txt_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=8, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
+        log_ctrl_bar2 = ttk.Frame(log_frame)
+        log_ctrl_bar2.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(log_ctrl_bar2, text="筛选:", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+        self.cbo_log_mode = ttk.Combobox(log_ctrl_bar2, values=("全部", "只看消息", "只看错误"),
+                                         width=9, state="readonly")
+        self.cbo_log_mode.set("全部")
+        self.cbo_log_mode.pack(side=tk.LEFT, padx=(4, 10))
+        self.cbo_log_mode.bind("<<ComboboxSelected>>", lambda e: self.refresh_log_view())
+        ttk.Label(log_ctrl_bar2, text="关键字:", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+        self.ent_log_filter = ttk.Entry(log_ctrl_bar2, width=18)
+        self.ent_log_filter.pack(side=tk.LEFT, padx=4)
+        self.ent_log_filter.bind("<KeyRelease>", lambda e: self.refresh_log_view())
+        ttk.Checkbutton(log_ctrl_bar2, text="自动滚动", variable=self.var_log_follow).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(log_ctrl_bar2, text="暂停", variable=self.var_log_pause).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(log_ctrl_bar2, text="📌 桌面快捷方式",
+                   command=self.create_desktop_shortcut).pack(side=tk.RIGHT, padx=2)
+
+        self.txt_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=9,
+                                                 font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
+                                                 insertbackground="white")
         self.txt_log.pack(fill=tk.BOTH, expand=True)
+        self.txt_log.tag_config("error", foreground="#ff7b72")
+        self.txt_log.tag_config("warn", foreground="#ffbd6b")
+        self.txt_log.tag_config("ok", foreground="#7ee787")
+        self.txt_log.tag_config("msg", foreground="#79c0ff")
+
+        self.lbl_log_status = ttk.Label(log_frame, text="", font=("微软雅黑", 8), foreground="#666666")
+        self.lbl_log_status.pack(fill=tk.X, pady=(4, 0))
+
+        self.prime_log_view()
 
     # 1. TAB: Engine
     def build_tab_engine(self):
@@ -539,7 +637,244 @@ class WeChatBotGUI(tk.Tk):
         btn_p.pack(fill=tk.X, pady=8)
         ttk.Button(btn_p, text="💾 保存人设 Prompt", command=self.save_ui_to_config).pack(side=tk.RIGHT)
 
-    # 3. TAB: Contacts
+    def _relation_choices(self):
+        """关系下拉候选：来自「A2A 关系路由」表（保证和端点配置一一对应），
+        再补上通讯录里已经用过、但路由表还没配的关系，避免已有数据丢选项。"""
+        vals = [rel for rel, _url in getattr(self, "_route_rows", []) if rel]
+        for c in (self.config_data.get("contacts") or []):
+            rel = str((c or {}).get("relation") or "").strip()
+            if rel and rel not in vals:
+                vals.append(rel)
+        return vals
+
+    # ---- A2A 关系路由（关系 → A2A 端点） --------------------------------
+    def _load_relation_routes(self):
+        """把配置里的 agent.relation_urls 读成有序表（关系, 端点）。"""
+        agent = self.config_data.get("agent") or {}
+        urls = agent.get("relation_urls") or {}
+        rows = []
+        if isinstance(urls, dict):
+            for rel, url in urls.items():
+                rel_s = str(rel or "").strip()
+                url_s = str(url or "").strip()
+                if rel_s:
+                    rows.append([rel_s, url_s])
+        self._route_rows = rows
+        self._refresh_routes_tree()
+
+    def _relation_url_map(self):
+        """当前路由表 → {关系: 端点}（空名/空地址的丢）。"""
+        return {rel: url for rel, url in getattr(self, "_route_rows", []) if rel and url}
+
+    def _sync_relation_urls(self):
+        """路由表改动后：写回 config_data，并同步通讯录页的关系下拉。"""
+        agent = dict(self.config_data.get("agent") or {})
+        agent["relation_urls"] = self._relation_url_map()
+        self.config_data["agent"] = agent
+        if hasattr(self, "cbo_ct_relation"):
+            self.cbo_ct_relation.configure(values=self._relation_choices())
+        self._refresh_contacts_tree()
+
+    def _refresh_routes_tree(self):
+        if not hasattr(self, "tree_routes"):
+            return
+        for item in self.tree_routes.get_children():
+            self.tree_routes.delete(item)
+        for rel, url in getattr(self, "_route_rows", []):
+            self.tree_routes.insert("", tk.END, values=(rel, url))
+        if hasattr(self, "lbl_route_default"):
+            agent = self.config_data.get("agent") or {}
+            self.lbl_route_default.configure(
+                text=f"默认端点（没配关系的人走这里）：{agent.get('url') or '（未配置）'}")
+
+    def on_route_select(self, event=None):
+        sel = self.tree_routes.selection()
+        if not sel:
+            return
+        vals = self.tree_routes.item(sel[0], "values")
+        self.ent_route_relation.delete(0, tk.END)
+        self.ent_route_relation.insert(0, vals[0] if vals else "")
+        self.ent_route_url.delete(0, tk.END)
+        self.ent_route_url.insert(0, vals[1] if len(vals) > 1 else "")
+
+    def add_route(self):
+        rel = self.ent_route_relation.get().strip()
+        url = self.ent_route_url.get().strip()
+        if not rel:
+            messagebox.showwarning("提示", "关系名不能为空（例如：家人、损友）")
+            return
+        if not re.match(r"^https?://", url):
+            messagebox.showwarning(
+                "提示", "A2A 端点要填完整地址，例如：\nhttp://192.168.31.20/a2a/relation-family")
+            return
+        rows = getattr(self, "_route_rows", [])
+        hit = next((r for r in rows if r[0] == rel), None)
+        if hit is not None:
+            hit[1] = url
+        else:
+            rows.append([rel, url])
+        self._route_rows = rows
+        self._refresh_routes_tree()
+        self._sync_relation_urls()
+
+    def del_route(self):
+        sel = self.tree_routes.selection()
+        if not sel:
+            return
+        rel = str(self.tree_routes.item(sel[0], "values")[0] or "").strip()
+        self._route_rows = [r for r in getattr(self, "_route_rows", []) if r[0] != rel]
+        self._refresh_routes_tree()
+        self._sync_relation_urls()
+
+    def build_tab_routes(self):
+        ttk.Label(
+            self.tab_routes,
+            text="🔀 关系 → A2A 端点：每个关系绑一个 DSH A2A 入站端点（人格在端点的预设里选）",
+            font=("微软雅黑", 9, "bold"),
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            self.tab_routes,
+            text="· 通讯录里给好友选「关系」，他的消息就会发到这个关系对应的端点\n"
+                 "· 改端点后，这个关系的人下一条消息自动走新端点（新端点 = 新会话）\n"
+                 "· 没配关系的人走「默认端点」",
+            foreground="#666666", font=("微软雅黑", 8), justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        body = ttk.Frame(self.tab_routes)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        right = ttk.LabelFrame(body, text=" 新增 / 编辑关系 ", padding=8)
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+        left = ttk.LabelFrame(body, text=" 关系路由表 ", padding=8)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+
+        self.tree_routes = ttk.Treeview(left, columns=("relation", "endpoint"),
+                                        show="headings", height=10)
+        self.tree_routes.heading("relation", text="关系")
+        self.tree_routes.heading("endpoint", text="A2A 端点（完整 URL）")
+        self.tree_routes.column("relation", width=120, anchor=tk.W)
+        self.tree_routes.column("endpoint", width=460, anchor=tk.W)
+        self.tree_routes.pack(fill=tk.BOTH, expand=True)
+        self.tree_routes.bind("<<TreeviewSelect>>", self.on_route_select)
+
+        row1 = ttk.Frame(right)
+        row1.pack(fill=tk.X, pady=3)
+        ttk.Label(row1, text="关系:", width=8).pack(side=tk.LEFT)
+        self.ent_route_relation = ttk.Combobox(
+            row1, width=22, state="normal",
+            values=["家人", "朋友", "同事", "客户", "领导", "恋人", "损友", "同学", "陌生"])
+        self.ent_route_relation.pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(right)
+        row2.pack(fill=tk.X, pady=3)
+        ttk.Label(row2, text="端点:", width=8).pack(side=tk.LEFT)
+        self.ent_route_url = ttk.Entry(row2, width=30)
+        self.ent_route_url.pack(side=tk.LEFT)
+        ttk.Label(right, text="例：http://192.168.31.20/a2a/relation-family",
+                  foreground="#666666", font=("微软雅黑", 8)).pack(anchor=tk.W, pady=(0, 2))
+
+        btns = ttk.Frame(right)
+        btns.pack(fill=tk.X, pady=(10, 3))
+        ttk.Button(btns, text="➕ 添加 / 更新", command=self.add_route).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="🗑️ 删除选中", command=self.del_route).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="💾 保存配置", command=self.save_ui_to_config).pack(fill=tk.X, pady=(12, 2))
+        self.lbl_route_default = ttk.Label(
+            right, text="默认端点（没配关系的人走这里）：—",
+            foreground="#1a73e8", font=("微软雅黑", 8), wraplength=250, justify=tk.LEFT)
+        self.lbl_route_default.pack(anchor=tk.W, pady=(6, 0))
+
+        self._refresh_routes_tree()
+
+    # ---- A2A 端点 / 会话显示（新端点=新会话） ---------------------------
+    BOT_API_BASE = "http://127.0.0.1:8765"
+
+    def _bot_api_json(self, path, payload=None, timeout=2.0):
+        """调 bot 本地接口（/sessions、/rotate）；bot 没跑或超时返回 None。"""
+        url = f"{self.BOT_API_BASE}{path}"
+        try:
+            if payload is None:
+                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=raw, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def _agent_sessions(self):
+        """{备注: 当前 contextId}；bot 没运行就返回空表。"""
+        data = self._bot_api_json("/sessions")
+        out = {}
+        if isinstance(data, dict):
+            for item in data.get("sessions") or []:
+                if isinstance(item, dict) and item.get("target"):
+                    out[str(item["target"])] = str(item.get("context") or "")
+        return out
+
+    def _relation_endpoint(self, relation):
+        """关系 → A2A 端点（来自 agent.relation_urls；未配置回落默认端点）。"""
+        agent = self.config_data.get("agent") or {}
+        urls = agent.get("relation_urls") or {}
+        url = urls.get(relation) if relation else None
+        return str(url or agent.get("url") or "")
+
+    @staticmethod
+    def _short_url(url):
+        """只显示路径部分（/a2a/relation-family），太长不好看。"""
+        try:
+            parts = urllib.parse.urlsplit(str(url or ""))
+            if parts.scheme and parts.netloc:
+                return (parts.path.rstrip("/") or "/")
+        except Exception:
+            pass
+        return str(url or "")
+
+    def _update_contact_agent_info(self, remark=""):
+        """刷新右侧「A2A 端点 / 当前会话」两块显示。"""
+        if not hasattr(self, "lbl_ct_endpoint"):
+            return
+        relation = (self.cbo_ct_relation.get() or "").strip()
+        line = f"关系「{relation or '未分组'}」"
+        line += "（未分组走默认端点）" if not relation else " → 端点见「🔀 A2A 关系路由」页"
+        self.lbl_ct_endpoint.configure(text=line)
+        sessions = getattr(self, "_agent_session_cache", {}) or {}
+        ctx = sessions.get(remark) if remark else None
+        if sessions:
+            self.lbl_ct_session.configure(text=f"当前会话：{ctx or '（还没有会话，下一条消息新建）'}")
+        else:
+            self.lbl_ct_session.configure(text="当前会话：bot 未运行 / 接口未响应")
+
+    def refresh_agent_sessions(self):
+        self._agent_session_cache = self._agent_sessions()
+        self._refresh_contacts_tree()
+        sel = self.tree_contacts.selection()
+        remark = ""
+        if sel:
+            vals = self.tree_contacts.item(sel[0], "values")
+            remark = str(vals[0]).strip() if vals else ""
+        self._update_contact_agent_info(remark)
+
+    def rotate_selected_contact(self):
+        """把选中联系人的会话换成一个全新的（写 bot 的轮换表，下一条消息起生效）。"""
+        sel = self.tree_contacts.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先在左边选一个联系人")
+            return
+        vals = self.tree_contacts.item(sel[0], "values")
+        remark = str(vals[0]).strip() if vals else ""
+        if not remark:
+            return
+        data = self._bot_api_json("/rotate", {"target": remark})
+        if not isinstance(data, dict) or not data.get("ok"):
+            messagebox.showerror("换新会话失败", "bot 接口没响应或返回异常，请确认 bot 正在运行。")
+            return
+        self._agent_session_cache = self._agent_sessions()
+        self._refresh_contacts_tree()
+        self._update_contact_agent_info(remark)
+        messagebox.showinfo("已换新会话", f"{remark}\n下一条消息起使用：\n{data.get('context')}")
+
     def build_tab_contacts(self):
         ttk.Label(
             self.tab_contacts,
@@ -564,11 +899,16 @@ class WeChatBotGUI(tk.Tk):
         left = ttk.LabelFrame(body, text=" 通讯录清单 ", padding=8)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
 
-        self.tree_contacts = ttk.Treeview(left, columns=("remark", "wxid"), show="headings", height=10)
+        self.tree_contacts = ttk.Treeview(left, columns=("remark", "wxid", "relation", "session"),
+                                          show="headings", height=10)
         self.tree_contacts.heading("remark", text="备注（微信显示名）")
         self.tree_contacts.heading("wxid", text="微信号 / 自定义号（可留空）")
-        self.tree_contacts.column("remark", width=200, anchor=tk.W)
+        self.tree_contacts.heading("relation", text="关系分组")
+        self.tree_contacts.heading("session", text="当前会话")
+        self.tree_contacts.column("remark", width=170, anchor=tk.W)
         self.tree_contacts.column("wxid", width=240, anchor=tk.W)
+        self.tree_contacts.column("relation", width=90, anchor=tk.W)
+        self.tree_contacts.column("session", width=200, anchor=tk.W)
         self.tree_contacts.pack(fill=tk.BOTH, expand=True)
         self.tree_contacts.bind("<<TreeviewSelect>>", self.on_contact_select)
 
@@ -583,6 +923,34 @@ class WeChatBotGUI(tk.Tk):
         ttk.Label(row2, text="微信号:", width=8).pack(side=tk.LEFT)
         self.ent_ct_wxid = ttk.Entry(row2, width=24)
         self.ent_ct_wxid.pack(side=tk.LEFT)
+
+        row3 = ttk.Frame(right)
+        row3.pack(fill=tk.X, pady=3)
+        ttk.Label(row3, text="关系:", width=8).pack(side=tk.LEFT)
+        self.cbo_ct_relation = ttk.Combobox(row3, width=22, state="normal",
+                                            values=self._relation_choices())
+        self.cbo_ct_relation.pack(side=tk.LEFT)
+        ttk.Label(right, text="（决定走哪个 A2A 关系端点，可自己填新关系名）",
+                  foreground="#666666", font=("微软雅黑", 8)).pack(anchor=tk.W, pady=(0, 2))
+        self.cbo_ct_relation.bind("<<ComboboxSelected>>", lambda _e: self._update_contact_agent_info(
+            (self.ent_ct_remark.get() or "").strip()))
+
+        sess_box = ttk.LabelFrame(right, text=" A2A 会话 ", padding=6)
+        sess_box.pack(fill=tk.X, pady=(8, 2))
+        self.lbl_ct_endpoint = ttk.Label(sess_box, text="关系「—」→ （未配置）",
+                                         foreground="#1a73e8", font=("微软雅黑", 8), wraplength=250,
+                                         justify=tk.LEFT)
+        self.lbl_ct_endpoint.pack(anchor=tk.W)
+        self.lbl_ct_session = ttk.Label(sess_box, text="当前会话：—",
+                                        foreground="#333333", font=("微软雅黑", 8), wraplength=250,
+                                        justify=tk.LEFT)
+        self.lbl_ct_session.pack(anchor=tk.W, pady=(2, 4))
+        ttk.Button(sess_box, text="🔄 换新会话（下一条消息生效）",
+                   command=self.rotate_selected_contact).pack(fill=tk.X, pady=2)
+        ttk.Button(sess_box, text="🔄 刷新会话状态", command=self.refresh_agent_sessions).pack(fill=tk.X, pady=2)
+        ttk.Label(sess_box, text="新端点 = 新会话；换关系端点后会自动用新会话",
+                  foreground="#666666", font=("微软雅黑", 8), wraplength=250,
+                  justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
 
         btns = ttk.Frame(right)
         btns.pack(fill=tk.X, pady=(10, 3))
@@ -797,6 +1165,9 @@ class WeChatBotGUI(tk.Tk):
         for b in c.get("blacklist", []):
             self.listbox_bl.insert(tk.END, b)
 
+        # A2A 关系路由（通讯录的关系下拉选项来自这里）
+        self._load_relation_routes()
+
         # 通讯录
         self._refresh_contacts_tree()
 
@@ -945,8 +1316,16 @@ class WeChatBotGUI(tk.Tk):
         for item in self.tree_contacts.get_children():
             self.tree_contacts.delete(item)
         rows = self._contacts_from_tree_source()
+        sessions = getattr(self, "_agent_session_cache", None)
+        if sessions is None:
+            sessions = self._agent_sessions()
+            self._agent_session_cache = sessions
         for c in rows:
-            self.tree_contacts.insert("", tk.END, values=(c.get("remark", ""), c.get("wxid", "")))
+            remark = c.get("remark", "")
+            relation = c.get("relation", "")
+            self.tree_contacts.insert("", tk.END, values=(
+                remark, c.get("wxid", ""), relation,
+                sessions.get(remark, "")))
         # 白名单页提示：通讯录里的人会自动并入白名单
         if hasattr(self, "lbl_wl_derived"):
             remarks = [c.get("remark", "") for c in rows if c.get("remark")]
@@ -970,8 +1349,12 @@ class WeChatBotGUI(tk.Tk):
             wxid = str(c.get("wxid") or c.get("wechat_id") or c.get("alias") or "").strip()
             if not remark and wxid:
                 remark = wxid
+            relation = str(c.get("relation") or "").strip()
             if remark:
-                out.append({"remark": remark, "wxid": wxid})
+                item = {"remark": remark, "wxid": wxid}
+                if relation:
+                    item["relation"] = relation
+                out.append(item)
         return out
 
     def on_contact_select(self, event=None):
@@ -983,10 +1366,13 @@ class WeChatBotGUI(tk.Tk):
         self.ent_ct_remark.insert(0, vals[0] if vals else "")
         self.ent_ct_wxid.delete(0, tk.END)
         self.ent_ct_wxid.insert(0, vals[1] if len(vals) > 1 else "")
+        self.cbo_ct_relation.set(vals[2] if len(vals) > 2 else "")
+        self._update_contact_agent_info(str(vals[0]).strip() if vals else "")
 
     def add_contact(self):
         remark = self.ent_ct_remark.get().strip()
         wxid = self.ent_ct_wxid.get().strip()
+        relation = self.cbo_ct_relation.get().strip()
         if not remark:
             messagebox.showwarning("提示", "备注不能为空（就是微信里显示的那个名字）")
             return
@@ -999,8 +1385,15 @@ class WeChatBotGUI(tk.Tk):
         if hit:
             hit["remark"] = remark
             hit["wxid"] = wxid
+            if relation:
+                hit["relation"] = relation
+            else:
+                hit.pop("relation", None)
         else:
-            contacts.append({"remark": remark, "wxid": wxid})
+            item = {"remark": remark, "wxid": wxid}
+            if relation:
+                item["relation"] = relation
+            contacts.append(item)
         self.config_data["contacts"] = contacts
         self._refresh_contacts_tree()
         self.save_config()
@@ -1056,6 +1449,7 @@ class WeChatBotGUI(tk.Tk):
             "timeout_seconds": timeout_v,
             "max_defer_seconds": defer_v,
             "fallback_replies": fallbacks or ["嘿嘿，我这会儿有点懵，等下再聊~"],
+            "relation_urls": self._relation_url_map(),
         }
 
     def _proactive_cfg_dict(self):
@@ -1353,6 +1747,21 @@ class WeChatBotGUI(tk.Tk):
             pass
 
         def _work():
+            use_systemd = IS_LINUX and os.path.exists(SYSTEMD_BOT_UNIT_FILE)
+            if use_systemd:
+                import subprocess as _sp
+                try:
+                    if action != "start":
+                        _sp.Popen(["systemctl", "--user", "stop", "wechat-bot"],
+                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        self._bot_action_result = (True, "已停止", "⏹️ 已停止 systemd 守护进程（wechat-bot.service）。")
+                    else:
+                        _sp.Popen(["systemctl", "--user", "restart", "wechat-bot"],
+                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        self._bot_action_result = (True, "启动成功", "🚀 已通过 systemd 重启守护进程（wechat-bot.service）！")
+                except Exception as e:
+                    self._bot_action_result = (False, "操作失败", f"systemctl 调用失败: {e}")
+                return
             try:
                 self.kill_bot_processes()
             except Exception:
@@ -1362,6 +1771,19 @@ class WeChatBotGUI(tk.Tk):
                 self._bot_action_result = (True, "已停止", "⏹️ 已停止所有微信 AI 自动回复进程。")
                 return
             try:
+                if IS_LINUX:
+                    import subprocess as _sp
+                    env = os.environ.copy()
+                    try:
+                        _sp.Popen([sys.executable, BOT_SCRIPT], cwd=WORKSPACE_DIR, env=env,
+                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                                  start_new_session=True)
+                        self._bot_action_result = (
+                            True, "启动成功",
+                            "🚀 微信 AI 自动回复守护进程已在后台启动（Linux，独立会话）！")
+                    except Exception as e:
+                        self._bot_action_result = (False, "启动失败", f"启动守护进程失败: {e}")
+                    return
                 SW_HIDE = 0
                 bot_exe = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.exe")
                 if not os.path.exists(bot_exe):
@@ -1471,18 +1893,127 @@ class WeChatBotGUI(tk.Tk):
     def restart_bot(self):
         self.start_bot()
 
+    # ---------------- 底部实时日志监听 ----------------
+    _LOG_BUFFER_LIMIT = 3000
+
+    def _read_log_tail(self, max_bytes=20000):
+        """读日志文件末尾一小段，用来在面板打开时先铺满历史。"""
+        try:
+            size = os.path.getsize(LOG_FILE)
+            if size <= 0:
+                return ""
+            with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                    f.readline()  # 丢掉被截断的首行
+                return f.read()
+        except Exception:
+            return ""
+
+    def prime_log_view(self):
+        """启动时把日志文件尾部灌进面板，并让 log_pos 与之衔接（不重复、不漏）。"""
+        tail = self._read_log_tail()
+        if tail:
+            self.append_log(tail)
+        try:
+            self.log_pos = os.path.getsize(LOG_FILE)
+        except Exception:
+            self.log_pos = 0
+        self.update_log_status()
+
+    def _log_tag_for(self, line):
+        if not line:
+            return None
+        if any(k in line for k in ("🚨", "❌", "Traceback", "Error:", "失败", "FAILED")):
+            return "error"
+        if any(k in line for k in ("⚠️", "警告", "降级")):
+            return "warn"
+        if any(k in line for k in ("✅", "成功")):
+            return "ok"
+        if any(k in line for k in ("📩", "📤", "🔀", "🎴", "🔄", "🚫", "收到", "回复")):
+            return "msg"
+        return None
+
+    def _log_line_visible(self, line):
+        tag = self._log_tag_for(line)
+        if self._log_mode == "只看消息" and tag not in ("msg", "ok"):
+            return False
+        if self._log_mode == "只看错误" and tag not in ("error", "warn"):
+            return False
+        kw = self._log_filter.lower()
+        if kw and kw not in line.lower():
+            return False
+        return True
+
+    def _insert_log_line(self, line):
+        tag = self._log_tag_for(line)
+        self.txt_log.insert(tk.END, line + "\n", (tag,) if tag else ())
+        self._log_total += 1
+
+    def append_log(self, text):
+        """监控线程把新增日志送进来：先进缓冲，再按筛选条件增量渲染。"""
+        if not text:
+            return
+        lines = text.splitlines()
+        self._log_buffer.extend(lines)
+        if len(self._log_buffer) > self._LOG_BUFFER_LIMIT:
+            del self._log_buffer[: len(self._log_buffer) - self._LOG_BUFFER_LIMIT]
+        if not self.var_log_pause.get():
+            for line in lines:
+                if self._log_line_visible(line):
+                    self._insert_log_line(line)
+            if self.var_log_follow.get():
+                self.txt_log.see(tk.END)
+            self._trim_log_widget()
+        self.update_log_status()
+
+    def _trim_log_widget(self):
+        try:
+            total = int(self.txt_log.index("end-1c").split(".")[0])
+        except Exception:
+            return
+        if total > 5000:
+            self.txt_log.delete("1.0", f"{total - 4000}.0")
+
+    def refresh_log_view(self):
+        """筛选条件变化时按缓冲重绘（暂停只挡新增，不影响重绘）。"""
+        self._log_mode = self.cbo_log_mode.get() or "全部"
+        self._log_filter = self.ent_log_filter.get().strip()
+        self.txt_log.delete("1.0", tk.END)
+        self._log_total = 0
+        for line in self._log_buffer:
+            if self._log_line_visible(line):
+                self._insert_log_line(line)
+        if self.var_log_follow.get():
+            self.txt_log.see(tk.END)
+        self.update_log_status()
+
+    def update_log_status(self):
+        ts = time.strftime("%H:%M:%S")
+        paused = " · 已暂停" if self.var_log_pause.get() else ""
+        self.lbl_log_status.configure(
+            text=f"文件: {os.path.basename(LOG_FILE)} · 面板 {self._log_total} 行"
+                 f" · 缓冲 {len(self._log_buffer)} 行 · 更新 {ts}{paused}")
+
     def clear_logs(self):
         try:
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write("")
-            self.log_pos = 0
-            self.txt_log.delete("1.0", tk.END)
         except Exception:
             pass
+        self.log_pos = 0
+        self._log_buffer = []
+        self._log_total = 0
+        self.txt_log.delete("1.0", tk.END)
+        self.update_log_status()
 
     def open_log_file(self):
         if os.path.exists(LOG_FILE):
-            os.startfile(LOG_FILE)
+            if IS_LINUX:
+                import subprocess as _sp
+                _sp.Popen(["xdg-open", LOG_FILE], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            else:
+                os.startfile(LOG_FILE)
         else:
             messagebox.showinfo("提示", "暂无日志文件。")
 
@@ -1587,7 +2118,7 @@ class WeChatBotGUI(tk.Tk):
                     self._ui_call(lambda wt=wx_text, wc=wx_color, bt=bot_text, bc=bot_color, nl=new_logs: self._update_ui_state(wt, wc, bt, bc, nl))
                 except Exception:
                     pass
-                time.sleep(1.5)
+                time.sleep(1.0)
 
         t = threading.Thread(target=monitor_loop, daemon=True)
         t.start()
@@ -1596,8 +2127,7 @@ class WeChatBotGUI(tk.Tk):
         self.lbl_wx_status.configure(text=wx_text, foreground=wx_color)
         self.lbl_bot_status.configure(text=bot_text, foreground=bot_color)
         if new_logs:
-            self.txt_log.insert(tk.END, new_logs)
-            self.txt_log.see(tk.END)
+            self.append_log(new_logs)
 
     # ---------------- P3: 待确认消息弹窗 ----------------
     def _load_pending_from_disk(self):

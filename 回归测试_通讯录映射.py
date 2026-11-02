@@ -95,7 +95,6 @@ def base_cfg(**kw):
             "enabled": True, "whitelist_only": True, "require_confirm": False,
             "max_per_hour": 3, "max_per_day": 20,
         },
-        "friend_personas": {},
         "agent": {"enabled": True},
     }
     d.update(kw)
@@ -170,7 +169,7 @@ section("4. canonical_target / 搜索键 / 会话键")
 # ---------------------------------------------------------------------------
 base_cfg(contacts=[{"remark": "张三", "wxid": "zhangsan_88"},
                    {"remark": "李四", "wxid": ""},
-                   {"remark": "官方号", "wxid": "wxid_abcdefghijklmno"}])
+                   {"remark": "官方号", "wxid": "wxid_27jcr0lsu2hc22"}])
 eq(bot.canonical_target("zhangsan_88"), "张三", "wxid → 备注")
 eq(bot.canonical_target("张三"), "张三", "备注 → 备注（原样）")
 eq(bot.canonical_target("陌生人"), "陌生人", "未知名字原样返回")
@@ -179,7 +178,7 @@ eq(bot.contact_search_key("李四"), "李四", "没微信号时搜索键退回�
 eq(bot.contact_search_key("官方号"), "官方号",
    "wxid_ 开头的官方微信号搜不到 → 搜索键退回备注")
 ok(bot.is_custom_wxid("zhangsan_88") is True, "自定义微信号判定为可搜")
-ok(bot.is_custom_wxid("wxid_abcdefghijklmno") is False, "官方 wxid_ 判定为不可搜")
+ok(bot.is_custom_wxid("wxid_27jcr0lsu2hc22") is False, "官方 wxid_ 判定为不可搜")
 ok(bot.is_custom_wxid("WXID_ABC") is False, "官方 wxid_ 大小写不敏感")
 ok(bot.is_custom_wxid("") is False, "空微信号不可搜")
 ok(bot.is_custom_wxid(None) is False, "None 微信号不可搜")

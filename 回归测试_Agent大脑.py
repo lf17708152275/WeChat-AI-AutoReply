@@ -119,7 +119,7 @@ class FakeClient(object):
     def context_id_for(self, sender):
         return f"wx-{sender}"
 
-    def ask(self, context_id, prompt, timeout=None):
+    def ask(self, context_id, prompt, timeout=None, target=""):
         self.calls.append((context_id, prompt))
         d = self.decision
         return dict(d) if isinstance(d, dict) else d
@@ -165,15 +165,15 @@ pc.logger = lambda m: None
 
 check("标准 JSON",
       pc._parse('{"action":"reply","text":"在的","urgency":"now","reason":"r"}'),
-      {"action": "reply", "text": "在的", "urgency": "now", "reason": "r"})
+      {"action": "reply", "text": "在的", "segments": ["在的"], "urgency": "now", "reason": "r"})
 
 check("markdown 围栏包裹",
       pc._parse('```json\n{"action":"ignore","text":"","urgency":"now","reason":"广告"}\n```'),
-      {"action": "ignore", "text": "", "urgency": "now", "reason": "广告"})
+      {"action": "ignore", "text": "", "segments": [], "urgency": "now", "reason": "广告"})
 
 check("前后夹带废话",
       pc._parse('好的，我判断如下：\n{"action":"reply","text":"来了","urgency":"soon","reason":"x"}\n以上。'),
-      {"action": "reply", "text": "来了", "urgency": "soon", "reason": "x"})
+      {"action": "reply", "text": "来了", "segments": ["来了"], "urgency": "soon", "reason": "x"})
 
 check("缺 action 但有正文 → reply",
       pc._parse('{"text":"哈哈哈","urgency":"now"}')["action"], "reply")
@@ -198,6 +198,24 @@ check("text 带 '回复：' 前缀被剥掉",
 
 check("完全不是 JSON → None", pc._parse("我建议回复：你好"), None)
 check("空串 → None", pc._parse(""), None)
+
+# ===========================================================================
+print("=== 1.5 多段回复解析（segments） ===")
+# ===========================================================================
+multi = pc._parse('{"action":"reply","segments":["你吃了吗","我刚下班"],"urgency":"now","reason":"r"}')
+check("segments 数组被解析", multi["segments"], ["你吃了吗", "我刚下班"])
+check("text 兼容字段是各段拼接", multi["text"], "你吃了吗\n我刚下班")
+check("单段 text 也归一成 segments", pc._parse('{"action":"reply","text":"好"}')["segments"], ["好"])
+check("text 里 ||| 兼容拆分", pc._parse('{"action":"reply","text":"第一句|||第二句"}')["segments"],
+      ["第一句", "第二句"])
+check("segments 里混对象也兼容",
+      pc._parse('{"action":"reply","segments":[{"text":"甲"},{"text":"乙"}]}')["segments"], ["甲", "乙"])
+check("最多 4 段",
+      len(pc._parse('{"action":"reply","segments":["1","2","3","4","5","6"]}')["segments"]), 4)
+check("相邻重复段去重",
+      pc._parse('{"action":"reply","segments":["在的","在的","咋了"]}')["segments"], ["在的", "咋了"])
+check("reply 且 segments 全空 → None",
+      pc._parse('{"action":"reply","segments":["","  "]}'), None)
 
 # ===========================================================================
 print("=== 2. urgency → 秒 ===")
@@ -230,6 +248,40 @@ off = agent_client.AgentClient({"agent": {"enabled": False}})
 off.logger = lambda m: None
 check("enabled=false 直接兜底", off.ask("wx-x", "hi")["reason"], "agent_unavailable")
 
+# ---------------------------------------------------------------------------
+print("=== 3.5 A2A 响应解析 / 关系端点路由 ===")
+# @hanphone/dsh-a2a 把文本切成逐字 chunk，必须拼起来
+_chunked = {
+    "result": {
+        "task": {
+            "status": {"state": "TASK_STATE_COMPLETED"},
+            "artifacts": [{"artifactId": "result",
+                           "parts": [{"text": "行"}, {"text": "啊"}, {"text": " 这就"},
+                                     {"text": "来"}]}],
+        }
+    }
+}
+check("逐字 parts 能拼成整句", agent_client.AgentClient._extract_text(_chunked), "行啊 这就来")
+
+_old_style = {"result": "好 马上"}
+check("老插件 result 纯文本也能兜住", agent_client.AgentClient._extract_text(_old_style), "好 马上")
+
+_failed = {"result": {"task": {"status": {"state": "TASK_STATE_FAILED"}, "artifacts": []}}}
+try:
+    agent_client.AgentClient._extract_text(_failed)
+    check("失败任务应抛错", "没抛", "抛错")
+except RuntimeError as e:
+    check_true("失败任务抛错", "TASK_STATE_FAILED" in str(e), str(e))
+
+# 关系 → 端点
+rc = agent_client.AgentClient({
+    "agent": {"url": "http://x/a2a", "relation_urls": {"家人": "http://x/a2a/family"}},
+    "contacts": [{"remark": "老爸", "relation": "家人"}, {"remark": "同事甲", "relation": "同事"}],
+})
+check("家人走专属端点", rc.url_for("老爸"), "http://x/a2a/family")
+check("没配的关系走默认", rc.url_for("同事甲"), "http://x/a2a")
+check("不在通讯录走默认", rc.url_for("路人"), "http://x/a2a")
+
 # ===========================================================================
 print("=== 4. 异步总线：reply + now 立即发 ===")
 # ===========================================================================
@@ -251,6 +303,57 @@ check("poll 返回 True", sent_any, True)
 check("签名已登记", bot.LAST_PROCESSED_SIGNATURE.get("张三"), ("sig1",))
 check_true("发完不再 busy", not bot.agent_busy_for("张三"))
 check("结果邮箱已清空", len(bot.AGENT_RESULTS), 0)
+
+# ===========================================================================
+print("=== 4.5 多段回复：逐条连发 ===")
+# ===========================================================================
+reset_bus()
+bot.LAST_PROCESSED_SIGNATURE.clear()
+bot.load_config = lambda: {
+    "agent": {"enabled": True, "url": "http://fake", "context_prefix": "wx-"},
+    "reply_delay_seconds": 0.0,
+    "include_prefix": False,
+    "segment_delay_min_seconds": 0.0,
+    "segment_delay_span_seconds": 0.0,
+}
+fc.decision = {"action": "reply", "segments": ["刚看到", "我在吃饭", "一会儿回你"],
+               "urgency": "now", "reason": "连发"}
+bot.submit_agent_job("多段甲", "在吗", ("sigM",), None)
+check_true("等待后台结果", wait_results())
+bot.poll_agent_results(hwnd=1, rect=(0, 0, 100, 100), layout={})
+check("三段都发出去了", len(SENT), 3)
+check("第一段内容", SENT[0][1] if SENT else None, "刚看到")
+check("第二段内容", SENT[1][1] if len(SENT) > 1 else None, "我在吃饭")
+check("第三段内容", SENT[2][1] if len(SENT) > 2 else None, "一会儿回你")
+check("三段发给同一个人", {r[0] for r in SENT}, {"多段甲"})
+check("签名已登记", bot.LAST_PROCESSED_SIGNATURE.get("多段甲"), ("sigM",))
+
+# 兼容旧契约：只有 text 时仍然是一条
+reset_bus()
+bot.LAST_PROCESSED_SIGNATURE.clear()
+fc.decision = {"action": "reply", "text": "只有一条", "urgency": "now", "reason": ""}
+bot.submit_agent_job("多段乙", "在吗", ("sigN",), None)
+check_true("等待后台结果", wait_results())
+bot.poll_agent_results(hwnd=1, rect=(0, 0, 100, 100), layout={})
+check("旧契约仍只发一条", len(SENT), 1)
+check("内容正确", SENT[0][1] if SENT else None, "只有一条")
+
+# 段数上限：超过 MAX_REPLY_SEGMENTS 的部分丢弃
+reset_bus()
+bot.LAST_PROCESSED_SIGNATURE.clear()
+fc.decision = {"action": "reply", "segments": ["1", "2", "3", "4", "5", "6"],
+               "urgency": "now", "reason": ""}
+bot.submit_agent_job("多段丙", "在吗", ("sigO",), None)
+check_true("等待后台结果", wait_results())
+bot.poll_agent_results(hwnd=1, rect=(0, 0, 100, 100), layout={})
+check("最多发 4 段", len(SENT), bot.MAX_REPLY_SEGMENTS)
+
+# 复原测试配置
+bot.load_config = lambda: {
+    "agent": {"enabled": True, "url": "http://fake", "context_prefix": "wx-"},
+    "reply_delay_seconds": 0.0,
+    "include_prefix": False,
+}
 
 # ===========================================================================
 print("=== 5. ignore：不发消息，但登记签名防空转 ===")
@@ -331,7 +434,7 @@ class SlowClient(FakeClient):
         FakeClient.__init__(self, {"action": "reply", "text": "旧回复", "urgency": "now", "reason": ""})
         self.n = 0
 
-    def ask(self, context_id, prompt, timeout=None):
+    def ask(self, context_id, prompt, timeout=None, target=""):
         self.n += 1
         n = self.n
         time.sleep(0.25 if n == 1 else 0.0)   # 第一次慢，第二次快
@@ -432,6 +535,96 @@ try:
     check("is_available 返回 False", c.is_available(), False)
 finally:
     agent_client.requests = saved_requests
+
+# ===========================================================================
+# 会话冲突自愈（DSH "session ... already exists" 会被当成回复文本返回）
+# ===========================================================================
+import tempfile
+
+_tmpdir = tempfile.mkdtemp()
+_rot_cfg = {"agent": {
+    "enabled": True,
+    "url": "http://fake/a2a",
+    "context_map_file": os.path.join(_tmpdir, "map.json"),
+    "context_rot_file": os.path.join(_tmpdir, "rot.json"),
+}}
+_c = agent_client.AgentClient(_rot_cfg)
+_c.logger = lambda m: None
+_seq = []
+
+
+def _fake_send(ctx, prompt, timeout):
+    _seq.append(ctx)
+    if ctx == "wx-abc":
+        return 'DSH agent executor error: session "a2a-wx-abc" already exists'
+    return '{"action":"reply","text":"好","urgency":"now","reason":"ok"}'
+
+
+_c._send = _fake_send
+_d = _c.ask("wx-abc", "在吗")
+check("会话冲突后能自愈并拿到决策", _d.get("text"), "好")
+check("自愈时换了新 contextId", _seq, ["wx-abc", "wx-abc-r2"])
+_seq.clear()
+_d2 = _c.ask("wx-abc", "再说一句")
+check("第二次直接用轮换后的 id（不再撞墙）", _seq, ["wx-abc-r2"])
+check("轮换表落盘", json.load(open(os.path.join(_tmpdir, "rot.json")))["wx-abc"], 2)
+check("冲突正则能识别真实报错",
+      bool(agent_client.SESSION_CONFLICT_RE.search(
+          'DSH agent executor error: session "a2a-w-x" already exists')), True)
+check("正常回复不会被误判成冲突",
+      bool(agent_client.SESSION_CONFLICT_RE.search('{"action":"reply","text":"好"}')), False)
+
+# ===========================================================================
+# 会话被占用自愈（DSH 重启后遗留的写句柄不会释放）
+# 真实报错是任务失败，原因藏在 status.message 里：
+#   session "a2a-..." is already owned by an active write handle
+# 以前 _extract_text 只抛 "任务未成功: TASK_STATE_FAILED"，上层只能当网络错误兜底，
+# 导致 bot 永远回"脑子卡壳"。
+# ===========================================================================
+_owned_cfg = {"agent": {
+    "enabled": True,
+    "url": "http://fake/a2a",
+    "context_map_file": os.path.join(_tmpdir, "map_owned.json"),
+    "context_rot_file": os.path.join(_tmpdir, "rot_owned.json"),
+}}
+_oc = agent_client.AgentClient(_owned_cfg)
+_oc.logger = lambda m: None
+_oseq = []
+
+
+def _fake_send_owned(ctx, prompt, timeout):
+    _oseq.append(ctx)
+    if ctx == "wx-own":
+        raise RuntimeError(
+            '任务未成功: TASK_STATE_FAILED (session "a2a-wx-own" '
+            'is already owned by an active write handle)')
+    return '{"action":"reply","segments":["来了","刚忙完"],"urgency":"now","reason":"ok"}'
+
+
+_oc._send = _fake_send_owned
+_od = _oc.ask("wx-own", "在吗")
+check("写句柄被占用后能自愈并拿到决策", _od.get("segments"), ["来了", "刚忙完"])
+check("被占用自愈时换了新 contextId", _oseq, ["wx-own", "wx-own", "wx-own-r2"])
+check("被占用正则能识别真实报错",
+      bool(agent_client.SESSION_OWNED_RE.search(
+          'session "a2a-w-x" is already owned by an active write handle')), True)
+check("正常回复不会被误判成被占用",
+      bool(agent_client.SESSION_OWNED_RE.search('{"action":"reply","text":"好"}')), False)
+
+# 失败原因要从 status.message 带进异常，否则上层无法判断该走哪种自愈
+_failed_body = {"result": {"task": {"status": {
+    "state": "TASK_STATE_FAILED",
+    "message": {"role": "ROLE_AGENT", "parts": [
+        {"text": 'session "x" is already owned by an active write handle'}]},
+}}}}
+try:
+    agent_client.AgentClient._extract_text(_failed_body)
+    _detail = ""
+except RuntimeError as exc:
+    _detail = str(exc)
+check("失败任务的 status.message 会带进异常",
+      "already owned by an active write handle" in _detail, True)
+
 
 # ===========================================================================
 print()
