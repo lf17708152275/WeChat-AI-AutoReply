@@ -361,10 +361,14 @@ Windows 与 Linux/X11 都已支持，平台差异全部收敛在 `wechat_linux_i
 | 键盘 | `SendInput` | XTest + 剪贴板粘贴（fcitx 会吞逐键字符） |
 | 隐藏微信 | 窗口移到 `(-3000, -3000)` | XComposite 离屏重定向 |
 
-**👻 隐藏微信至离屏（Linux）**：GUI 顶栏按钮。开启后微信从桌面消失、不再抢焦点，
-bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）；需要切换会话时会临时召回窗口，
+**👻 隐藏微信至离屏（Linux）**：GUI 顶栏按钮。开启后窗口被 Composite 重定向
+（画面改画到服务器端 pixmap）并移到屏幕外，桌面看不见、也不抢你的键盘焦点；
+bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）。需要切换会话时会临时召回窗口，
 切完自动藏回去。依赖 X 服务器的 Composite 扩展（xrdp 的 Xorg、Xvfb 都自带），
 不支持时会明确报错而不是静默失败。窗口几何记在 `wechat_config_dev.json` 的 `saved_window_rect`。
+
+> 离屏时 Chromium 会降帧渲染，气泡出现可能晚 1~2 秒：发送侧改为多轮轮询，
+> 一旦 Enter 已发出就**绝不重发**（避免给同一个人发两遍）。
 
 Linux 依赖安装（无 pip 环境的手动装法）、`DISPLAY` / `XAUTHORITY` 设置、七套回归测试的跑法，
 见 **[Linux移植规划.md](Linux移植规划.md)** 与本文档「🧪 回归测试」一节。

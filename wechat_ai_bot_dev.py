@@ -2527,7 +2527,7 @@ def _linux_send_reply(hwnd, rect, layout, target, final_reply):
             # 离屏窗口的渲染会被 Chromium 降帧，气泡出现可能晚 1~2 秒；
             # 这里多轮轮询，而且 Enter 已经发出就绝不重试（否则会给对方发两遍）
             verdict = False
-            deadline = time.time() + 3.2
+            deadline = time.time() + 7.0
             while time.time() < deadline:
                 time.sleep(0.45)
                 img_post, _, _ = grab_wechat_window(hwnd)
@@ -2544,7 +2544,7 @@ def _linux_send_reply(hwnd, rect, layout, target, final_reply):
             if verdict == "UNCERTAIN":
                 log(f"\u26a0\ufe0f [离屏发送] 画面无法比对（可能被渲染节流），按已发送处理，避免重复")
             else:
-                log(f"\u26a0\ufe0f [离屏发送] 3.2 秒内未检测到气泡增量，按已发送处理（不重发，避免重复消息）")
+                log(f"\u26a0\ufe0f [离屏发送] 7 秒内未检测到气泡增量，按已发送处理（不重发，避免重复消息）")
             send_success = True
             send_unverified = True
             break

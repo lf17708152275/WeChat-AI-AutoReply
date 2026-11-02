@@ -281,6 +281,7 @@ def occlusion_ratio(wid, rect=None, threshold=0.02):
 # 要用鼠标点窗口内坐标时（切会话/搜索）必须先 show_window 再操作，因为
 # 隐藏时屏幕坐标上根本没有这个窗口，XTest 的鼠标事件会打到别人身上。
 _HIDDEN = set()
+_HIDDEN_GEOM = {}
 _COMPOSITE_OK = None
 
 
@@ -298,8 +299,41 @@ def is_hidden(wid):
     return int(wid) in _HIDDEN
 
 
+def _repaint_desktop_region(x, y, width, height):
+    """强制桌面把某块区域重画一遍（窗口离开屏幕后，旧像素不会自己消失）。"""
+    try:
+        with _LOCK:
+            d = dpy()
+            d.set_error_handler(lambda *a, **k: None)   # 桌面窗可能拒绝 ClearArea，静默跳过
+            root = d.screen().root
+            for child in root.query_tree().children:
+                try:
+                    cls = _wm_class(child)
+                    if not cls:
+                        continue
+                    name = (cls[0] if isinstance(cls, (tuple, list)) else str(cls)).lower()
+                    if 'desktop' in name:
+                        child.clear_area(int(x), int(y), int(width), int(height), True)
+                        d.sync()
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    finally:
+        try:
+            dpy().set_error_handler(None)
+        except Exception:
+            pass
+    return False
+
+
 def hide_window(wid):
-    """把窗口转入离屏（桌面上彻底看不见），返回是否成功。"""
+    """把窗口转入离屏：桌面看不见、不抢焦点，但 bot 仍能抓图/发消息。
+
+    做法是 Composite 重定向（内容改画到服务器端 pixmap）+ 把窗口移到屏幕外，
+    再把原位置的桌面重画一遍（纯重定向会留下旧像素，看起来像还开着）。
+    """
     wid = int(wid)
     if wid in _HIDDEN:
         return True
@@ -309,28 +343,47 @@ def hide_window(wid):
         from Xlib.ext import composite
         with _LOCK:
             d = dpy()
+            screen = d.screen()
             w = d.create_resource_object("window", wid)
+            rect = window_rect(wid)
+            if rect.width <= 1 or rect.height <= 1:
+                return False
+            _HIDDEN_GEOM[wid] = (rect.left, rect.top, rect.width, rect.height)
             w.composite_redirect_window(composite.RedirectAutomatic)
             d.sync()
-        _HIDDEN.add(wid)
+            w.configure(x=screen.width_in_pixels + 400, y=rect.top,
+                        width=rect.width, height=rect.height)
+            d.sync()
+            _HIDDEN.add(wid)
+        _repaint_desktop_region(rect.left, rect.top, rect.width, rect.height)
         return True
     except Exception:
+        _HIDDEN.discard(wid)
+        _HIDDEN_GEOM.pop(wid, None)
         return False
 
 
 def show_window(wid):
-    """把离屏窗口召回桌面。"""
+    """把离屏窗口召回桌面原来的位置。"""
     wid = int(wid)
     if wid not in _HIDDEN:
         return True
+    geom = _HIDDEN_GEOM.pop(wid, None)
     try:
         from Xlib.ext import composite
         with _LOCK:
             d = dpy()
             w = d.create_resource_object("window", wid)
+            if geom is not None:
+                x, y, width, height = geom
+                w.configure(x=int(x), y=int(y), width=int(width), height=int(height))
+                d.sync()
             w.composite_unredirect_window(composite.RedirectAutomatic)
             d.sync()
         _HIDDEN.discard(wid)
+        if geom is not None:
+            ret = window_rect(wid)
+            _repaint_desktop_region(ret.left, ret.top, ret.width, ret.height)
         return True
     except Exception:
         return False
