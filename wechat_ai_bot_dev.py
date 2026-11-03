@@ -1938,6 +1938,36 @@ def _ocr_call(img):
         return [], None
 
 
+def _ocr_header_title(img, layout):
+    """顶栏标题兜底：整幅 OCR 偶尔漏掉 2~3 个字的标题（detection 阈值问题，
+    实测同一帧里侧栏的同名文字能识别、顶栏却漏）。单独裁顶栏再 OCR，
+    必要时放大 2 倍，能稳定拿到标题，避免"顶栏【未知】"导致反复切会话。"""
+    W, H = img.size
+    chat_start_x = int(layout["chat_start_x"])
+    header_h = int(layout["header_h"])
+    x0 = max(0, chat_start_x - 30)
+    x1 = min(W, chat_start_x + int(0.45 * (W - chat_start_x)))
+    y1 = min(H, header_h + 6)
+    if x1 - x0 < 40 or y1 < 20:
+        return ""
+    band = img.crop((x0, 0, x1, y1))
+    for factor in (1, 2):
+        try:
+            target = band if factor == 1 else band.resize(
+                (band.width * factor, band.height * factor), Image.Resampling.LANCZOS)
+            res_band, _ = _ocr_call(target)
+        except Exception:
+            continue
+        if not res_band:
+            continue
+        shifted = [([[p[0] / factor + x0, p[1] / factor] for p in b], t, sc)
+                   for b, t, sc in res_band]
+        title = extract_active_chat_title(shifted, layout)
+        if title:
+            return title
+    return ""
+
+
 def _scan_window(hwnd):
     """
     抓图 + OCR + 布局 + 顶栏标题，一次到位。
@@ -1957,7 +1987,10 @@ def _scan_window(hwnd):
         res = [([[p[0] / ratio, p[1] / ratio] for p in b], t, s) for b, t, s in (raw or [])]
     else:
         res, _ = _ocr_call(img)
-    return img, layout, res, extract_active_chat_title(res, layout)
+    title = extract_active_chat_title(res, layout)
+    if not title:
+        title = _ocr_header_title(img, layout)
+    return img, layout, res, title
 
 
 def _sidebar_row_y(res, layout, target, H):

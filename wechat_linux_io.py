@@ -151,13 +151,30 @@ def _is_viewable(w):
 
 
 def window_rect(wid):
-    """窗口在屏幕上的绝对矩形（含窗口管理器边框的话按客户端区域算）。"""
-    d = dpy()
-    w = d.create_resource_object("window", int(wid))
-    t = w.translate_coords(d.screen().root, 0, 0)
-    g = w.get_geometry()
-    x, y = -t.x, -t.y
-    return Rect(x, y, x + g.width, y + g.height)
+    """窗口在屏幕上的绝对矩形；窗口已销毁/不可探时返回 None。
+
+    弹出窗（搜索框）关闭时机和我们的调用存在竞态：拿到 id 后窗口可能已经没了，
+    TranslateCoords 会抛 BadWindow。这里统一吞成 None，让调用方按"窗口没了"处理，
+    而不是把异常抛进主循环。
+    """
+    try:
+        d = dpy()
+        w = d.create_resource_object("window", int(wid))
+        t = w.translate_coords(d.screen().root, 0, 0)
+        g = w.get_geometry()
+        x, y = -t.x, -t.y
+        return Rect(x, y, x + g.width, y + g.height)
+    except Exception:
+        return None
+
+
+def is_alive(wid):
+    """窗口是否还活着且 mapped（用于搜索弹窗等短命窗口的安全判定）。"""
+    try:
+        w = dpy().create_resource_object("window", int(wid))
+        return w.get_attributes().map_state == X.IsViewable
+    except Exception:
+        return False
 
 
 def _wechat_windows():
@@ -259,7 +276,7 @@ def stacked_above(wid):
             if cls == "wechat":
                 continue
             r = window_rect(w)
-            if r.width < 60 or r.height < 60:
+            if r is None or r.width < 60 or r.height < 60:
                 continue
             out.append((w, r, cls))
         except Exception:
@@ -282,6 +299,8 @@ def _overlap_ratio(rect, other):
 def occlusion_ratio(wid, rect=None, threshold=0.02):
     """被别的窗口挡住了多少面积（0~1）。"""
     rect = rect or window_rect(wid)
+    if rect is None:
+        return 0.0
     total = 0.0
     for _w, r, _cls in stacked_above(wid):
         total += _overlap_ratio(rect, r)
@@ -364,7 +383,7 @@ def hide_window(wid):
             screen = d.screen()
             w = d.create_resource_object("window", wid)
             rect = window_rect(wid)
-            if rect.width <= 1 or rect.height <= 1:
+            if rect is None or rect.width <= 1 or rect.height <= 1:
                 return False
             _HIDDEN_GEOM[wid] = (rect.left, rect.top, rect.width, rect.height)
             w.composite_redirect_window(composite.RedirectAutomatic)
@@ -401,7 +420,8 @@ def show_window(wid):
         _HIDDEN.discard(wid)
         if geom is not None:
             ret = window_rect(wid)
-            _repaint_desktop_region(ret.left, ret.top, ret.width, ret.height)
+            if ret is not None:
+                _repaint_desktop_region(ret.left, ret.top, ret.width, ret.height)
         return True
     except Exception:
         return False
@@ -463,7 +483,7 @@ def grab_window(wid, retries=2):
         ensure_visible(wid)
 
     rect = window_rect(wid)
-    if rect.width <= 0 or rect.height <= 0:
+    if rect is None or rect.width <= 0 or rect.height <= 0:
         return None, rect, 1.0
 
     # 遮挡判定：其他窗口压在上面时，直接抓图会把别人的界面 OCR 成微信消息
@@ -476,6 +496,8 @@ def grab_window(wid, retries=2):
                 activate(wid)
                 time.sleep(0.3)
                 rect = window_rect(wid)
+                if rect is None:
+                    return None, None, 1.0
                 occl = occlusion_ratio(wid, rect)
                 if occl > _OCCL_TOLERATE:
                     log_occlusion(wid, occl)
@@ -618,6 +640,8 @@ def ensure_visible(wid, timeout=3.0):
 def click_client(wid, x, y, button=1):
     """点击窗口内坐标（抓图像素坐标 == 窗口内坐标，无边框偏移）。"""
     rect = window_rect(wid)
+    if rect is None:
+        return False
     ax, ay = rect.left + int(x), rect.top + int(y)
     d = dpy()
     with _LOCK:
@@ -630,6 +654,7 @@ def click_client(wid, x, y, button=1):
         xtest.fake_input(d, X.ButtonRelease, button)
         d.sync()
         time.sleep(0.05)
+    return True
 
 
 # Windows VK → X11 keysym 名
@@ -764,9 +789,8 @@ def probe():
     wid, ver = find_wechat_window()
     info = {"wid": hex(wid) if wid else None, "ver": ver}
     if wid:
-        info["rect"] = tuple(window_rect(wid).__dict__.values()) if False else (
-            window_rect(wid).left, window_rect(wid).top,
-            window_rect(wid).width, window_rect(wid).height)
+        _r = window_rect(wid)
+        info["rect"] = None if _r is None else (_r.left, _r.top, _r.width, _r.height)
         info["viewable"] = is_viewable(wid)
         info["popup"] = hex(find_popup(wid, timeout=0.0) or 0)
     return info
