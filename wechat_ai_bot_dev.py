@@ -714,7 +714,7 @@ def is_name_matched_strict(contact_name, whitelist):
                 raw_variants.append(name_part)
 
     # 群聊防火墙只否决「名字本身就像群」的文本（"吃喝玩乐(25)"、"工作群"）。
-    # 但 "老爸(3)" / "22-撩人精(2)" 剥掉尾缀能精确命中白名单，那就是未读数，不能误杀 ——
+    # 但 "张三(3)" / "22-撩人精(2)" 剥掉尾缀能精确命中白名单，那就是未读数，不能误杀 ——
     # 所以命中白名单时用原始文本返回，后续群名判定仍按原名走，不会把群放进来。
     strictly_matched = False
     if pcards:
@@ -1506,14 +1506,40 @@ def _decision_stickers(decision):
     return out[:2]
 
 
-def download_sticker(url):
+def _configured_agent_hosts(cfg=None):
+    """表情图的合法来源主机：回环 + 配置里出现过的 A2A 主机。"""
+    from urllib.parse import urlparse
+    hosts = {"127.0.0.1", "localhost", "::1"}
+    agent = (cfg or {}).get("agent") if isinstance(cfg, dict) else None
+    raw_urls = []
+    if isinstance(agent, dict):
+        raw_urls.append(agent.get("url"))
+        raw_urls.append(agent.get("card_url"))
+        rel = agent.get("relation_urls")
+        if isinstance(rel, dict):
+            raw_urls.extend(rel.values())
+        elif isinstance(rel, list):
+            for item in rel:
+                if isinstance(item, dict):
+                    raw_urls.append(item.get("url"))
+    for raw in raw_urls:
+        try:
+            host = (urlparse(str(raw or "")).hostname or "").lower()
+        except Exception:
+            continue
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+def download_sticker(url, cfg=None):
     """下载表情到本地临时文件；失败返回 None。"""
     try:
         from urllib.parse import urlparse, urlunparse
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        if host not in ("127.0.0.1", "localhost", "192.168.31.20"):
-            log(f"⚠️ [表情] 拒绝下载非本机地址的表情: {host}")
+        if host not in _configured_agent_hosts(cfg):
+            log(f"⚠️ [表情] 拒绝下载非白名单主机的表情: {host}")
             return None
         # 统一走回环，避免 nginx/Host 校验差异
         netloc = f"127.0.0.1:{parsed.port or 25675}"
@@ -1605,7 +1631,7 @@ def _deliver_stickers(target, urls, signature, hwnd, rect, layout, cfg, source="
     """逐张发表情；失败不重试（宁可少一张，也不重复刷屏）。"""
     sent = 0
     for url in urls or []:
-        path = download_sticker(url)
+        path = download_sticker(url, cfg)
         if not path:
             continue
         try:
@@ -3556,7 +3582,7 @@ def _proactive_http_handler():
                 return self._json(200, {"ok": True, "sessions": items})
             if path == "/rotate":
                 return self._json(400, {"ok": False, "code": "use_post",
-                                        "detail": "请用 POST /rotate，body: {\"target\":\"老爸\"}"})
+                                        "detail": "请用 POST /rotate，body: {\"target\":\"张三\"}"})
             return self._json(404, {"ok": False, "code": "not_found"})
 
         def do_POST(self):

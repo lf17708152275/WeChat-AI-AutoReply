@@ -24,7 +24,7 @@
 | 发送消息 | Ctrl+A → 粘贴 → Enter（输入法抢占时改点「发送」按钮） | ✅ 消息落到会话里 | 3s |
 
 实测截图证据：`/tmp/wx_now.png`（会话）、`/tmp/open_ok2.png`（打开"文件传输助手"）、
-`/tmp/dad1.png`（老爸会话气泡）。
+`/tmp/dad1.png`（张三会话气泡）。
 
 ---
 
@@ -104,7 +104,7 @@ export DISPLAY=:10 XAUTHORITY=$HOME/.Xauthority
 
 python3 linux_wechat_driver.py probe          # 窗口/几何/焦点
 python3 linux_wechat_driver.py grab out.png   # 截图
-python3 linux_wechat_driver.py open 老爸       # 打开会话（OCR 校验）
+python3 linux_wechat_driver.py open 张三       # 打开会话（OCR 校验）
 python3 linux_wechat_driver.py send "你好"     # 发消息
 ```
 
@@ -148,7 +148,7 @@ cd ~/桌面/project/WeChat-AI-AutoReply
 | 抓图 | 0.08 s / 876×635 |
 | `_scan_window` 顶栏识别 | 0.86 s，标题 `文件传输助手` |
 | `_search_and_open("文件传输助手")` | ✅ 7.3 s |
-| `find_contact("老爸")` / `("文件传输助手")` | ✅ 2.0 s / 3.1 s |
+| `find_contact("张三")` / `("文件传输助手")` | ✅ 2.0 s / 3.1 s |
 | `send_reply_instant()` | ✅ 3.9 s（日志 `✅ [Linux 静默秒回成功]`） |
 | 主循环 | 3 轮各 ~1.3 s，无异常 |
 | GUI 启动 | ✅ 窗口 1320×880，顶栏显示「🟢 微信客户端: 正常连接 (WeChat 4.x)」 |
@@ -171,17 +171,17 @@ for d in /tmp/*.deb; do dpkg-deb -x "$d" ~/.local/tkroot; done   # start_linux.s
 18:01 在 Linux 上跑主循环，日志完整走通：
 
 ```
-📩 [当前会话锁定·连发聚合] 收到当前好友【老爸】新消息(1条): "等下吃什么？"
-🧠 [已交给 Agent] 好友【老爸】: "等下吃什么？"（后台思考中，主循环继续巡检）
+📩 [当前会话锁定·连发聚合] 收到当前好友【张三】新消息(1条): "等下吃什么？"
+🧠 [已交给 Agent] 好友【张三】: "等下吃什么？"（后台思考中，主循环继续巡检）
 🚨 [Agent 降级] transport_error: ... 127.0.0.1:44708 ... Connection refused → 改用固定可爱回复兜底
-💬 [Agent 决策] 好友【老爸】: 啊呀，脑子突然卡壳了，晚点回你哈  (urgency=now, 耗时 0.8s)
-📤 正在回复【老爸】: 啊呀，脑子突然卡壳了，晚点回你哈
-✅ [Linux 静默秒回成功] 已回复【老爸】
+💬 [Agent 决策] 好友【张三】: 啊呀，脑子突然卡壳了，晚点回你哈  (urgency=now, 耗时 0.8s)
+📤 正在回复【张三】: 啊呀，脑子突然卡壳了，晚点回你哈
+✅ [Linux 静默秒回成功] 已回复【张三】
 ```
 
 界面上左侧灰色气泡（对方 17:58）+ 右侧绿色气泡（机器人 18:01）同框，肉眼可核。
 
-> 注：白名单为空时主循环不会回复任何人——测试时临时把 `whitelist` 置为 `["老爸"]`，
+> 注：白名单为空时主循环不会回复任何人——测试时临时把 `whitelist` 置为 `["张三"]`，
 > 测完已还原为 `[]`。上线前记得在 GUI「白名单与防扰」里把要托管的好友加进去。
 
 ### 6.6 仍未覆盖
@@ -201,8 +201,8 @@ for d in /tmp/*.deb; do dpkg-deb -x "$d" ~/.local/tkroot; done   # start_linux.s
 OCR 成了"好友发来的消息"，日志里出现：
 
 ```
-📩 收到当前好友【老爸】新消息(1条): "随和幽默/接梗达人，你现在是微信账号的主人……"
-📩 收到当前好友【老爸】新消息(1条): "口实时运行日志（Auto-Scroll)"
+📩 收到当前好友【张三】新消息(1条): "随和幽默/接梗达人，你现在是微信账号的主人……"
+📩 收到当前好友【张三】新消息(1条): "口实时运行日志（Auto-Scroll)"
 ```
 
 修复（`wechat_linux_io.py`）：

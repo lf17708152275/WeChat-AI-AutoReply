@@ -276,9 +276,9 @@ except RuntimeError as e:
 # 关系 → 端点
 rc = agent_client.AgentClient({
     "agent": {"url": "http://x/a2a", "relation_urls": {"家人": "http://x/a2a/family"}},
-    "contacts": [{"remark": "老爸", "relation": "家人"}, {"remark": "同事甲", "relation": "同事"}],
+    "contacts": [{"remark": "张三", "relation": "家人"}, {"remark": "同事甲", "relation": "同事"}],
 })
-check("家人走专属端点", rc.url_for("老爸"), "http://x/a2a/family")
+check("家人走专属端点", rc.url_for("张三"), "http://x/a2a/family")
 check("没配的关系走默认", rc.url_for("同事甲"), "http://x/a2a")
 check("不在通讯录走默认", rc.url_for("路人"), "http://x/a2a")
 

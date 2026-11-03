@@ -185,16 +185,16 @@ curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" 
 {
     "agent": {
         "relation_urls": {
-            "家人": "http://192.168.31.20/a2a/relation-family",
-            "朋友": "http://192.168.31.20/a2a/relation-friend",
-            "损友": "http://192.168.31.20/a2a/relation-bro"
+            "家人": "http://192.168.1.100/a2a/relation-family",
+            "朋友": "http://192.168.1.100/a2a/relation-friend",
+            "损友": "http://192.168.1.100/a2a/relation-bro"
         }
     }
 }
 ```
 
 - 优先级：`relation_urls[关系]` → `agent.url`（没填关系的人走默认端点）。
-- 首次给某个好友分流时日志会打一行 `🔀 [A2A 路由] 好友【老爸】→ 关系「家人」→ http://…`，方便核对。
+- 首次给某个好友分流时日志会打一行 `🔀 [A2A 路由] 好友【张三】→ 关系「家人」→ http://…`，方便核对。
 - **人格卡不在 bot 里**：bot 只负责 OCR/发送/桥接，人设由 DSH 微信端点的 `preset`（如 `card-22` 撩人精）提供，改卡不用重启 bot。
 
 Agent 返回的契约（一行 JSON）：

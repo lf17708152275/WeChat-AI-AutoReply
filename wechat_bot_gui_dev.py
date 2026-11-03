@@ -705,7 +705,7 @@ class WeChatBotGUI(tk.Tk):
             return
         if not re.match(r"^https?://", url):
             messagebox.showwarning(
-                "提示", "A2A 端点要填完整地址，例如：\nhttp://192.168.31.20/a2a/relation-family")
+                "提示", "A2A 端点要填完整地址，例如：\nhttp://192.168.1.100/a2a/relation-family")
             return
         rows = getattr(self, "_route_rows", [])
         hit = next((r for r in rows if r[0] == rel), None)
@@ -770,7 +770,7 @@ class WeChatBotGUI(tk.Tk):
         ttk.Label(row2, text="端点:", width=8).pack(side=tk.LEFT)
         self.ent_route_url = ttk.Entry(row2, width=30)
         self.ent_route_url.pack(side=tk.LEFT)
-        ttk.Label(right, text="例：http://192.168.31.20/a2a/relation-family",
+        ttk.Label(right, text="例：http://192.168.1.100/a2a/relation-family",
                   foreground="#666666", font=("微软雅黑", 8)).pack(anchor=tk.W, pady=(0, 2))
 
         btns = ttk.Frame(right)

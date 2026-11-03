@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | profile | `a2a-test`（全新，从 web 模板初始化） |
-| 目录 | `/home/long/.dsh/profiles/a2a-test` |
+| 目录 | `~/.dsh/profiles/a2a-test` |
 | 安装命令 | `dsh plugin --profile a2a-test add @hanphone/dsh-a2a` |
 | 实例 | `A2A_PORT=8900 dsh --profile a2a-test --host 127.0.0.1 --port 3100 --no-open`（PID 6301） |
 | 面板地址 | `http://127.0.0.1:3100/?token=-SGDlBSx3EYiodG3KFjzlefweKy80I4oDM52UKCXrm8` |
@@ -42,14 +42,14 @@
 
 - `/a2a/family` → 1.99s，`TASK_STATE_COMPLETED`
 - `/a2a/daily` → 1.46s，`TASK_STATE_COMPLETED`
-- 会话按 `a2a-<serverId>-<contextId>` 落盘：`/home/long/.dsh/storages/session_projcache/sessions/a2a-server-a5a058e1-ctx-fam-1.json`
+- 会话按 `a2a-<serverId>-<contextId>` 落盘：`~/.dsh/storages/session_projcache/sessions/a2a-server-a5a058e1-ctx-fam-1.json`
 
 **结论：端点级的 preset 隔离是真的生效**，一个 URL 一个 preset 一套会话。
 
 ## 四、三个必须先知道的坑
 
 1. **面板 API 只允许本机访问。** `lib/index.js:1213` 的 `isLoopback(req)` 判定 `remoteAddress` 必须是 127.0.0.1/::1，否则直接 403 `forbidden`。
-   → 面板必须在**本机浏览器**打开 `http://127.0.0.1:3100/...`；从 192.168.31.20 打开会 403。
+   → 面板必须在**本机浏览器**打开 `http://127.0.0.1:3100/...`；从 192.168.1.100 打开会 403。
    主实例现在是 `--host 127.0.0.1` 挂在 80 反代后面，浏览器来源会被判成非 loopback —— **这点得先想清楚**（要么本机开，要么改插件）。
 
 2. **响应形状跟现在不一样。** 现在是 `result.task.status.state` + `result.task.artifacts[].parts[]`，
@@ -96,10 +96,10 @@ curl -b cj.txt -H 'content-type: application/json' -X POST http://127.0.0.1:3100
 | 卸载旧插件 | `dsh plugin --profile web remove @ryubyte/dsh-a2a` → 0.3.1 已移除 |
 | 安装新插件 | `dsh plugin --profile web add @hanphone/dsh-a2a` → 0.5.2，已进 `dsh.profile.bundles` |
 | 插件图校验 | `dsh --profile web --dump-config` 只出现 `id: a2a / name: '@hanphone/dsh-a2a'`，无 ryubyte 残留 |
-| 清理测试 profile | `/home/long/.dsh/profiles/a2a-test` 已删（含 node_modules/profiles 元数据） |
+| 清理测试 profile | `~/.dsh/profiles/a2a-test` 已删（含 node_modules/profiles 元数据） |
 | 清理测试实例 | 进程 6301 已停，3100 端口已释放 |
 | 清理测试会话 | `a2a-server-5814671e-ctx-day-1.json`、`a2a-server-a5a058e1-ctx-fam-1.json` 已删 |
-| 保留 | 旧插件的历史 agent 会话（`~/.dsh/sessions/--home-long-.dsh-profiles-web-.a2a-sessions--`，940K）——那是老爸/老朋友的历史记忆，没删 |
+| 保留 | 旧插件的历史 agent 会话（`~/.dsh/sessions/--home-long-.dsh-profiles-web-.a2a-sessions--`，940K）——那是张三/李四的历史记忆，没删 |
 
 ## bot 侧已适配（重启 dsh 后即可用）
 1. `agent_client._extract_text()` 支持新插件的**逐字 chunk**：新增 `_join_parts()` 把同一 artifact 的所有 `parts[].text` 拼起来（原来只取最后一个 part，会拿到单个字）。
@@ -113,16 +113,16 @@ curl -b cj.txt -H 'content-type: application/json' -X POST http://127.0.0.1:3100
 kill 1041
 # 起（原样的命令，脱离终端）
 (setsid node /usr/local/bin/dsh web --host 127.0.0.1 --port 25675 \
-  --trusted-host 192.168.31.20 --public-url http://192.168.31.20 --no-open \
+  --trusted-host 192.168.1.100 --public-url http://192.168.1.100 --no-open \
   >/tmp/dsh_web.log 2>&1 < /dev/null &)
 ```
 
 ## 重启后要做的
 1. 面板建两个入站端点（本机或经 nginx 都行，nginx 反代来源是 127.0.0.1 能过 loopback 判定）：
 ```bash
-curl -b cj.txt -H 'content-type: application/json' -X POST http://192.168.31.20/a2a/api \
+curl -b cj.txt -H 'content-type: application/json' -X POST http://192.168.1.100/a2a/api \
   -d '{"action":"inbound.create","name":"日常本人大号","preset":"standard","endpointPath":"/a2a/default"}'
-curl -b cj.txt -H 'content-type: application/json' -X POST http://192.168.31.20/a2a/api \
+curl -b cj.txt -H 'content-type: application/json' -X POST http://192.168.1.100/a2a/api \
   -d '{"action":"inbound.create","name":"家人·体贴","preset":"standard","endpointPath":"/a2a/family"}'
 ```
 2. 起 bot：`./start_linux.sh`
@@ -140,8 +140,8 @@ curl -b cj.txt -H 'content-type: application/json' -X POST http://192.168.31.20/
 | 插件版本 | `/a2a/api` → `{"version":"0.5.2"}`，旧端点 `/a2a` 已 404 |
 | 入站端点 | `server-a5a058e1` 家人·体贴 → `/a2a/family`（preset=standard）<br>`server-5814671e` 日常本人大号 → `/a2a/default`（原 `/a2a/daily`，已 `inbound.update` 改名） |
 | 端点直连 | 两个端点均 `TASK_STATE_COMPLETED`，9.6s / 7.9s |
-| bot 启动 | PID 见 `pgrep -f wechat_ai_bot_dev.py`，日志 `🔌 [Agent 大脑已接入] http://192.168.31.20/a2a/default` |
-| **真实来信闭环** | 老爸发「还在不」→ 🎴《家人·体贴》（来源：**关系:家人**，走 `/a2a/family`）→ 决策 1.3s「在呢 咋了爸」→ ✅ 秒回上屏 |
+| bot 启动 | PID 见 `pgrep -f wechat_ai_bot_dev.py`，日志 `🔌 [Agent 大脑已接入] http://192.168.1.100/a2a/default` |
+| **真实来信闭环** | 张三发「还在不」→ 🎴《家人·体贴》（来源：**关系:家人**，走 `/a2a/family`）→ 决策 1.3s「在呢 咋了爸」→ ✅ 秒回上屏 |
 
 ## 这次踩到并修掉的三个坑
 
@@ -161,4 +161,4 @@ curl -b cj.txt -H 'content-type: application/json' -X POST http://192.168.31.20/
 ## 当前回归状态（2026-11-02 17:45）
 8 套全绿：防串发匹配、待确认队列 44、主动发送 64、Agent大脑（含新增 6 项）、人格卡 59、通讯录映射 77、GUI配置面板 59、待确认GUI 23。
 
-> GUI 两套需要 tkinter 环境：`source /tmp/linux_env.sh`（TKROOT=/home/long/.local/tkroot）。
+> GUI 两套需要 tkinter 环境：`source /tmp/linux_env.sh`（TKROOT=~/.local/tkroot）。

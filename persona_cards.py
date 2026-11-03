@@ -10,7 +10,7 @@
 对外只需要三个函数：
 
     card = load_card("persona_cards/builtin/日常本人大号.json")
-    prompt = build_system_prompt(card, friend="老爸", recent=["等下吃什么？"], now="18:20")
+    prompt = build_system_prompt(card, friend="张三", recent=["等下吃什么？"], now="18:20")
     card = active_card(cfg)          # 按配置里 persona_card 字段取当前启用的卡（带缓存）
 
 设计取舍：不引入 jinja / 不跑 SillyTavern 的完整 prompt 管线，
@@ -410,7 +410,7 @@ def normalize_title(title):
 
     只剥「行尾孤立的 (3) / （12）」这种：
         "ai聊天群(3)"   -> "ai聊天群"
-        "老爸(2)"       -> "老爸"
+        "张三(2)"       -> "张三"
     但**不动**以数字开头或中间带数字的备注：
         "22-撩人精(3)"  -> "22-撩人精"     （保留 22，名字的一部分）
         "微信 2"        -> "微信 2"
@@ -555,7 +555,7 @@ def _main(argv):  # pragma: no cover - 手工调试用
     p_show.add_argument("card")
     p_prompt = sub.add_parser("prompt", help="直接看拼出来的 system prompt")
     p_prompt.add_argument("card")
-    p_prompt.add_argument("--friend", default="老爸")
+    p_prompt.add_argument("--friend", default="张三")
     p_prompt.add_argument("--recent", default="", help="最近消息，用 | 分隔")
     p_imp = sub.add_parser("import", help="导入一张卡（JSON/PNG）到 persona_cards/")
     p_imp.add_argument("path")

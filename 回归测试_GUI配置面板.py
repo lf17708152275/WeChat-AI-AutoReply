@@ -107,7 +107,7 @@ route_rows = [app.tree_routes.item(i, "values") for i in app.tree_routes.get_chi
 check("关系路由条数与配置一致", len(route_rows), len(SEED_RELATION_URLS))
 app.ent_route_relation.set("测试关系")
 app.ent_route_url.delete(0, "end")
-app.ent_route_url.insert(0, "http://192.168.31.20/a2a/relation-test")
+app.ent_route_url.insert(0, "http://192.168.1.100/a2a/relation-test")
 app.add_route()
 app.update()
 route_rows = [app.tree_routes.item(i, "values") for i in app.tree_routes.get_children()]
@@ -121,7 +121,7 @@ app.tree_routes.selection_set(_route_id[0])
 app.on_route_select()
 app.update()
 check("选中路由回填关系", app.ent_route_relation.get(), "测试关系")
-check("选中路由回填端点", app.ent_route_url.get(), "http://192.168.31.20/a2a/relation-test")
+check("选中路由回填端点", app.ent_route_url.get(), "http://192.168.1.100/a2a/relation-test")
 app.del_route()
 app.update()
 route_rows = [app.tree_routes.item(i, "values") for i in app.tree_routes.get_children()]
