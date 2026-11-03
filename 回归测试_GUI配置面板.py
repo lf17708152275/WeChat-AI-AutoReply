@@ -105,6 +105,11 @@ check("通讯录关系下拉只读（不能手打，只能选路由表里的关�
       str(app.cbo_ct_relation.cget("state")), "readonly")
 route_rows = [app.tree_routes.item(i, "values") for i in app.tree_routes.get_children()]
 check("关系路由条数与配置一致", len(route_rows), len(SEED_RELATION_URLS))
+# 首次打开 GUI 时，通讯录下拉必须**一开始**就包含路由表里的全部关系
+# （旧 bug：_load_relation_routes 在通讯录页建好之后才跑，没回填，导致只剩通讯录里用过的两个）
+_dropdown = list(app.cbo_ct_relation.cget("values"))
+check("通讯录关系下拉初始值=路由表全部关系",
+      _dropdown, [r[0] for r in route_rows])
 app.ent_route_relation.set("测试关系")
 app.ent_route_url.delete(0, "end")
 app.ent_route_url.insert(0, "http://192.168.1.100/a2a/relation-test")
@@ -332,31 +337,40 @@ gui.messagebox.showwarning = lambda *a, **k: None
 app3 = gui.WeChatBotGUI()
 app3.update()
 
+check_true("启停已合并为一个开关按钮（btn_start/btn_stop 不再存在）",
+           hasattr(app3, "btn_toggle") and not hasattr(app3, "btn_start") and not hasattr(app3, "btn_stop"))
+check("未运行时开关文案=启动", str(app3.btn_toggle.cget("text")), "🚀 启动 AI 自动回复")
+
 _t0 = _time.time()
 app3.start_bot()
 check_true("点击启动立刻返回（<0.25s）", _time.time() - _t0 < 0.25)
 check("启动中 busy 标记", app3._bot_action_running, True)
-check("启动中按钮禁用", str(app3.btn_start.cget("state")), "disabled")
+check("启动中开关禁用", str(app3.btn_toggle.cget("state")), "disabled")
+check("启动中文案", str(app3.btn_toggle.cget("text")), "⏳ 正在启动…")
 for _ in range(100):
     app3.update()
     _time.sleep(0.05)
     if not app3._bot_action_running:
         break
 check("启动完成后 busy 标记复位", app3._bot_action_running, False)
-check("启动完成后按钮恢复", str(app3.btn_start.cget("state")), "normal")
+check("启动完成后开关可用", str(app3.btn_toggle.cget("state")), "normal")
+check("启动完成后文案=停止守护", str(app3.btn_toggle.cget("text")), "⏹️ 停止守护")
 check_true("启动走 systemd 重启、不再拉第二份进程",
            bool(_spawned) and "systemctl" in str(_spawned[-1]) and "wechat-bot" in str(_spawned[-1]))
 
+# 同一个按钮再点一次 = 停止（toggle 语义）
 _t0 = _time.time()
-app3.stop_bot()
+app3.toggle_bot()
 check_true("点击停止立刻返回（<0.25s）", _time.time() - _t0 < 0.25)
+check("停止中文案", str(app3.btn_toggle.cget("text")), "⏳ 正在停止…")
 for _ in range(100):
     app3.update()
     _time.sleep(0.05)
     if not app3._bot_action_running:
         break
 check("停止完成后 busy 标记复位", app3._bot_action_running, False)
-check("停止完成后按钮恢复", str(app3.btn_stop.cget("state")), "normal")
+check("停止完成后开关可用", str(app3.btn_toggle.cget("state")), "normal")
+check("停止完成后文案=启动", str(app3.btn_toggle.cget("text")), "🚀 启动 AI 自动回复")
 check_true("停止走 systemd stop",
            bool(_spawned) and "stop" in str(_spawned[-1]) and "systemctl" in str(_spawned[-1]))
 

@@ -283,6 +283,7 @@ class WeChatBotGUI(tk.Tk):
         self.log_pos = 0
         self.is_monitoring = True
         self._confirm_dialog_open = False
+        self._bot_running_cache = False   # 后台状态轮询写入，供"启停开关"按钮显示当前状态
 
         self.create_widgets()
         self.load_settings_to_ui()
@@ -458,11 +459,9 @@ class WeChatBotGUI(tk.Tk):
         btn_box = ttk.Frame(top_frame)
         btn_box.pack(side=tk.RIGHT)
 
-        self.btn_start = ttk.Button(btn_box, text="🚀 启动 AI 自动回复", command=self.start_bot)
-        self.btn_start.pack(side=tk.LEFT, padx=4)
-
-        self.btn_stop = ttk.Button(btn_box, text="⏹️ 停止守护", command=self.stop_bot)
-        self.btn_stop.pack(side=tk.LEFT, padx=4)
+        # 启动 / 停止 合并成一个开关按钮：文案与可用态由后台状态轮询驱动
+        self.btn_toggle = ttk.Button(btn_box, text="🚀 启动 AI 自动回复", command=self.toggle_bot)
+        self.btn_toggle.pack(side=tk.LEFT, padx=4)
 
         self.btn_hide_wx = ttk.Button(btn_box, text="👻 隐藏微信至离屏", command=self.toggle_offscreen_wechat)
         self.btn_hide_wx.pack(side=tk.LEFT, padx=4)
@@ -670,6 +669,12 @@ class WeChatBotGUI(tk.Tk):
                     rows.append([rel_s, url_s])
         self._route_rows = rows
         self._refresh_routes_tree()
+        # 关系下拉候选必须跟着路由表走（首次加载时通讯录页已建好，这里要回填一次）
+        if hasattr(self, "cbo_ct_relation"):
+            try:
+                self.cbo_ct_relation.configure(values=self._relation_choices())
+            except Exception:
+                pass
 
     def _relation_url_map(self):
         """当前路由表 → {关系: 端点}（空名/空地址的丢）。"""
@@ -1724,20 +1729,35 @@ class WeChatBotGUI(tk.Tk):
                 pass
 
     def _set_bot_buttons(self, busy, action="start"):
-        """启停进行中时禁用按钮并改文案，避免重复点击 + 让用户看到反馈。"""
+        """启停进行中：禁用开关按钮并显示进度文案。"""
         try:
             if busy:
-                self.btn_start.configure(state="disabled")
-                self.btn_stop.configure(state="disabled")
-                if action == "start":
-                    self.btn_start.configure(text="⏳ 正在启动…")
-                else:
-                    self.btn_stop.configure(text="⏳ 正在停止…")
+                self.btn_toggle.configure(
+                    state="disabled",
+                    text=("⏳ 正在启动…" if action == "start" else "⏳ 正在停止…"))
             else:
-                self.btn_start.configure(state="normal", text="🚀 启动 AI 自动回复")
-                self.btn_stop.configure(state="normal", text="⏹️ 停止守护")
+                self._refresh_toggle_button()
         except Exception:
             pass
+
+    def _refresh_toggle_button(self):
+        """按当前运行状态刷新区关按钮的文案（运行中显示"停止"，否则显示"启动"）。"""
+        try:
+            running = bool(getattr(self, "_bot_running_cache", False))
+            self.btn_toggle.configure(
+                state="normal",
+                text=("⏹️ 停止守护" if running else "🚀 启动 AI 自动回复"))
+        except Exception:
+            pass
+
+    def toggle_bot(self):
+        """一个按钮搞定启停：运行中就停，没运行就启动。"""
+        if getattr(self, "_bot_action_running", False):
+            return
+        if getattr(self, "_bot_running_cache", False):
+            self.stop_bot()
+        else:
+            self.start_bot()
 
     def _run_bot_action(self, action):
         """把「杀进程 / 拉进程」这种阻塞活丢到后台线程，主线程只轮询结果，彻底不卡界面。"""
@@ -1820,6 +1840,9 @@ class WeChatBotGUI(tk.Tk):
         ok, title, msg = self._bot_action_result
         self._bot_action_result = None
         self._bot_action_running = False
+        if ok:
+            # 立刻反映到开关文案，不用等下一轮状态轮询
+            self._bot_running_cache = (self._bot_action_kind == "start")
         self._set_bot_buttons(False)
         if ok:
             messagebox.showinfo(title, msg)
@@ -2143,6 +2166,7 @@ class WeChatBotGUI(tk.Tk):
                 # 2. Check Bot process
                 try:
                     running, pid = self.is_bot_running()
+                    self._bot_running_cache = bool(running)
                     if running:
                         bot_text = f"🟢 AI 守护进程: 正在运行 (PID: {pid})"
                         bot_color = "#107c41"
@@ -2181,6 +2205,8 @@ class WeChatBotGUI(tk.Tk):
     def _update_ui_state(self, wx_text, wx_color, bot_text, bot_color, new_logs):
         self.lbl_wx_status.configure(text=wx_text, foreground=wx_color)
         self.lbl_bot_status.configure(text=bot_text, foreground=bot_color)
+        if not getattr(self, "_bot_action_running", False):
+            self._refresh_toggle_button()
         if new_logs:
             self.append_log(new_logs)
 
