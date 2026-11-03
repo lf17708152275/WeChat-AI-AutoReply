@@ -57,7 +57,22 @@
       "啊呀，脑子突然卡壳了，晚点回你哈",
       "我这边有点小状况，一会儿再来找你~",
       "等等我，手头有点事，马上回来！"
-    ]
+    ],
+    "voice": {
+      "enabled": false,
+      "mode": "bubble",
+      "max_chars": 120,
+      "voice": "",
+      "instruction": "",
+      "edge_fallback": true,
+      "edge_voice": "zh-CN-XiaoxuanNeural",
+      "timeout": 180,
+      "fallback_file": true,
+      "virtual_source": "wx_tts_source",
+      "virtual_sink": "wx_tts_sink",
+      "record_tail": 0.45,
+      "min_record_seconds": 1.2
+    }
   },
   "proactive_send": {
     "enabled": false,

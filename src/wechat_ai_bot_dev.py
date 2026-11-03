@@ -41,6 +41,7 @@ except Exception:                     # 缺文件时退回纯 system_prompt 老�
 
 try:
     from agent_client import AgentClient, build_prompt
+    import voice_tts
 except Exception as _agent_import_err:  # 缺文件时不影响老的大模型直连路径
     AgentClient = None
     build_prompt = None
@@ -1369,18 +1370,20 @@ def _deliver_reply(target, texts, signature, hwnd, rect, layout, cfg, source="sc
     return True
 
 
-def _schedule_outbox(target, texts, signature, delay_s, source, stickers=None):
+def _schedule_outbox(target, texts, signature, delay_s, source, stickers=None, voices=None):
     if isinstance(texts, str):
         texts = [texts]
     texts = [str(t).strip() for t in (texts or []) if str(t or "").strip()]
     stickers = [str(u).strip() for u in (stickers or []) if str(u or "").strip()]
-    if delay_s <= 0 or (not texts and not stickers):
+    voices = [str(v).strip() for v in (voices or []) if str(v or "").strip()]
+    if delay_s <= 0 or (not texts and not stickers and not voices):
         return False
     with AGENT_LOCK:
         AGENT_OUTBOX.append({
             "target": target,
             "texts": texts,
             "stickers": stickers,
+            "voices": voices,
             "signature": signature,
             "due_ts": time.time() + delay_s,
             "attempt": 0,
@@ -1636,6 +1639,54 @@ def _decision_stickers(decision):
     return out[:2]
 
 
+def _voice_cfg(cfg=None):
+    """读取语音配置（agent.voice 或顶层 voice），缺省不开以免打扰。"""
+    cfg = cfg or {}
+    raw = cfg.get("voice") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        agent = cfg.get("agent") if isinstance(cfg, dict) else None
+        raw = agent.get("voice") if isinstance(agent, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = str(raw.get("mode") or "bubble").strip().lower()
+    if mode not in ("bubble", "file"):
+        mode = "bubble"
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "max_chars": int(raw.get("max_chars") or 120),
+        "voice": str(raw.get("voice") or ""),
+        "instruction": str(raw.get("instruction") or ""),
+        "edge_fallback": bool(raw.get("edge_fallback", True)),
+        "edge_voice": str(raw.get("edge_voice") or "zh-CN-XiaoxuanNeural"),
+        "timeout": float(raw.get("timeout") or 180.0),
+        "mode": mode,
+        "fallback_file": bool(raw.get("fallback_file", True)),
+        "virtual_source": str(raw.get("virtual_source") or "wx_tts_source"),
+        "virtual_sink": str(raw.get("virtual_sink") or "wx_tts_sink"),
+        "record_tail": float(raw.get("record_tail") or 0.45),
+        "min_record_seconds": float(raw.get("min_record_seconds") or 1.2),
+    }
+
+
+def _decision_voices(decision):
+    """从决策里取出要合成的语音文本（已按配置过滤长度/开关）。"""
+    raw = (decision or {}).get("voice_texts")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        t = str(item or "").strip()
+        if not t:
+            continue
+        t = re.sub(r"[\[\]\r\n]+", " ", t)
+        t = re.sub(r"\s{2,}", " ", t).strip()
+        if t and t not in out:
+            out.append(t)
+    return out[:1]
+
+
 def _configured_agent_hosts(cfg=None):
     """表情图的合法来源主机：回环 + 配置里出现过的 A2A 主机。"""
     from urllib.parse import urlparse
@@ -1801,6 +1852,354 @@ def _deliver_stickers(target, urls, signature, hwnd, rect, layout, cfg, source="
     return sent > 0
 
 
+def _wait_popup(timeout=2.0, want=True):
+    """等微信弹出「选择文件」对话框（或等它消失）。返回 True/False。"""
+    if not lx:
+        return False
+    end = time.time() + max(0.2, timeout)
+    while time.time() < end:
+        try:
+            popup = (lx.probe() or {}).get("popup") or 0
+        except Exception:
+            popup = 0
+        if bool(popup) == bool(want):
+            return True
+        time.sleep(0.08)
+    return False
+
+
+def _pactl(*args, timeout=12.0):
+    """调用 pactl，返回 (ok, stdout)。系统没装 pulseaudio-utils 时静默失败。"""
+    import subprocess
+    try:
+        r = subprocess.run(["pactl"] + list(args), capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or "").strip()
+    except Exception:
+        return False, ""
+
+
+def _audio_sources():
+    ok, out = _pactl("list", "short", "sources")
+    names = []
+    if ok:
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                names.append(parts[1])
+    return names
+
+
+def _ensure_virtual_mic(sink="wx_tts_sink", source="wx_tts_source", log_fn=None):
+    """准备一个「虚拟麦克风」：null sink + 它的 monitor 重映射成 source。
+
+    语音气泡方案：微信从默认录音设备抓音，我们把 TTS 音频 paplay 进 null sink，
+    微信录到的就是这段音频；发完把默认设备还回去。
+    """
+    log_fn = log_fn or log
+    sources = _audio_sources()
+    if source in sources:
+        return True
+    if not any(s.startswith(sink) for s in sources) and (sink + ".monitor") not in sources:
+        ok, _ = _pactl("load-module", "module-null-sink", "sink_name=%s" % sink,
+                       "sink_properties=device.description=%s" % sink)
+        if not ok:
+            log_fn("⚠️ [语音] 无法创建虚拟扬声器（pactl load-module null-sink 失败）")
+            return False
+    ok, _ = _pactl("load-module", "module-remap-source",
+                   "master=%s.monitor" % sink, "source_name=%s" % source,
+                   "source_properties=device.description=%s" % source)
+    if not ok:
+        log_fn("⚠️ [语音] 无法创建虚拟麦克风（pactl load-module remap-source 失败）")
+        return False
+    time.sleep(0.35)
+    return source in _audio_sources()
+
+
+def _physical_source(exclude=()):
+    """挑一个真实麦克风源（非虚拟/非 monitor），用于恢复默认录音设备。"""
+    skip = set(exclude) | {"wx_tts_source", "wx_tts_sink.monitor"}
+    for name in _audio_sources():
+        if name in skip or name.endswith(".monitor"):
+            continue
+        return name
+    return ""
+
+
+def _default_source():
+    ok, out = _pactl("get-default-source")
+    return out if ok else ""
+
+
+def _set_default_source(name):
+    if not name:
+        return False
+    ok, _ = _pactl("set-default-source", name)
+    return ok
+
+
+def _press_client_point(hwnd, client_x, client_y):
+    if IS_LINUX:
+        return bool(lx and lx.press_client(hwnd, client_x, client_y))
+    post_click_client_point(hwnd, client_x, client_y)
+    return True
+
+
+def _release_client_point(hwnd, client_x, client_y):
+    if IS_LINUX:
+        return bool(lx and lx.release_client(hwnd, client_x, client_y))
+    return True
+
+
+def _voice_button_points(W, H):
+    """返回 (语音按钮坐标, 按住说话条中心坐标)，按窗口比例算。
+
+    实测 wx 4.1.13.26（1008x756）：发语音按钮 (860,706)、按住条 (770,700)。
+    """
+    icon = (int(0.853 * W), int(0.934 * H))
+    bar = (int(0.764 * W), int(0.926 * H))
+    return icon, bar
+
+
+def _send_voice_bubble(hwnd, layout, target, path, cfg=None):
+    """发一条真·语音气泡：虚拟麦克风喂 TTS 音频 + 按住说话条。
+
+    流程：核验会话 -> 切默认录音设备为虚拟麦克风 -> 点「发语音」
+          -> 按住语音条并播放音频 -> 松开（微信自动发送）-> 恢复默认设备。
+    """
+    if not lx or not path or not os.path.isfile(path):
+        return False
+    import subprocess
+
+    vcfg = _voice_cfg(cfg)
+    sink = vcfg["virtual_sink"]
+    source = vcfg["virtual_source"]
+
+    img_now, _, _ = grab_wechat_window(hwnd)
+    if img_now is None:
+        log("⚠️ [语音] 抓不到微信画面，跳过")
+        return False
+
+    hidden = bool(lx.is_hidden(hwnd))
+    if hidden:
+        log("🖥️ [语音] 语音气泡需要按住说话条，临时召回微信（发完重新隐藏）")
+        lx.show_window(hwnd)
+        time.sleep(0.45)
+
+    prev_source = _default_source()
+    player = None
+    pressed = False
+    try:
+        # 顶栏核验 + 必要时切换会话
+        _, _, _, cur_title = _scan_window(hwnd)
+        if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+            switched = _linux_search_and_open(hwnd, target)
+            if not switched:
+                log(f"🚫 [语音] 无法锁定会话【{target}】，放弃发这条语音")
+                return False
+            time.sleep(0.5)
+            img_now, _, _ = grab_wechat_window(hwnd)
+            if img_now is None:
+                return False
+            _, _, _, cur_title = _scan_window(hwnd)
+            if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+                log(f"🚫 [语音] 切换后顶栏仍是【{cur_title or '未知'}】")
+                return False
+
+        if not activate_wechat(hwnd):
+            log("🚫 [语音] 微信没拿到键盘焦点，跳过")
+            return False
+
+        if not _ensure_virtual_mic(sink, source):
+            return False
+        if prev_source and prev_source != source and not _set_default_source(source):
+            log("⚠️ [语音] 切换默认录音设备失败")
+            return False
+        time.sleep(0.25)
+
+        cur_W, cur_H = img_now.size
+        icon_pt, bar_pt = _voice_button_points(cur_W, cur_H)
+        post_click_client_point(hwnd, icon_pt[0], icon_pt[1])   # 点「发语音」
+        time.sleep(0.55)
+
+        duration = voice_tts.duration_seconds(path)
+        hold = max(vcfg["min_record_seconds"], duration + vcfg["record_tail"])
+
+        _press_client_point(hwnd, bar_pt[0], bar_pt[1])
+        pressed = True
+        time.sleep(0.30)
+        try:
+            player = subprocess.Popen(["paplay", "-d", sink, os.path.abspath(path)],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log(f"⚠️ [语音] 播放失败（paplay）: {type(e).__name__}: {e}")
+        time.sleep(max(0.1, hold))
+        _release_client_point(hwnd, bar_pt[0], bar_pt[1])
+        pressed = False
+        time.sleep(0.9)
+        log(f"🎙️ [语音] 已发语音气泡【{target}】：{duration:.1f}s 音频，按住 {hold:.1f}s")
+        return True
+    except Exception as e:
+        log(f"⚠️ [语音] 气泡发送异常: {type(e).__name__}: {e}")
+        return False
+    finally:
+        try:
+            if pressed:
+                _release_client_point(hwnd, bar_pt[0], bar_pt[1])
+        except Exception:
+            pass
+        try:
+            if player is not None and player.poll() is None:
+                player.terminate()
+        except Exception:
+            pass
+        restore_to = prev_source
+        if not restore_to or restore_to == source:
+            restore_to = _physical_source(exclude=(source,))
+        if restore_to and restore_to != source:
+            _set_default_source(restore_to)
+        if hidden:
+            time.sleep(0.25)
+            try:
+                lx.hide_window(hwnd)
+            except Exception:
+                pass
+
+
+def _send_voice_file(hwnd, layout, target, path, cfg=None):
+    """把本地音频文件当「文件消息」发给当前会话（WeChat Linux 无语音气泡，走文件发送）。
+
+    流程：核验顶栏 -> 点「文件」图标 -> 等文件选择框 -> 粘贴绝对路径 -> Enter
+          -> 等附件卡出现 -> Enter 发送。
+    离屏隐藏模式下需要临时召回窗口（文件框必须可见才能操作），发完自动重新隐藏。
+    """
+    if not lx or not path or not os.path.isfile(path):
+        return False
+
+    img_now, _, _ = grab_wechat_window(hwnd)
+    if img_now is None:
+        log("⚠️ [语音] 抓不到微信画面，跳过")
+        return False
+
+    hidden = bool(lx.is_hidden(hwnd))
+    if hidden:
+        log("🖥️ [语音] 文件发送需要点文件框，临时召回微信（发完重新隐藏）")
+        lx.show_window(hwnd)
+        time.sleep(0.45)
+
+    try:
+        # 顶栏核验 + 必要时切换会话
+        _, _, _, cur_title = _scan_window(hwnd)
+        if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+            log(f"⚠️ [语音纠偏] 当前顶栏【{cur_title or '未知'}】不是【{target}】，先切过去")
+            switched = _linux_search_and_open(hwnd, target)
+            if not switched:
+                log(f"🚫 [语音中止] 无法锁定会话【{target}】，放弃发这条语音")
+                return False
+            time.sleep(0.45)
+            img_now, _, _ = grab_wechat_window(hwnd)
+            if img_now is None:
+                return False
+            _, _, _, cur_title = _scan_window(hwnd)
+            if not (cur_title and is_name_matched_strict(cur_title, [target])[0]):
+                log(f"🚫 [语音中止] 切换后顶栏仍是【{cur_title or '未知'}】")
+                return False
+
+        if not activate_wechat(hwnd):
+            log("🚫 [语音] 微信没拿到键盘焦点，跳过（防止文件框被别的窗口接管）")
+            return False
+
+        cur_W, cur_H = img_now.size
+        cur_layout = compute_wechat_layout(cur_W, cur_H, img_now)
+
+        # 「文件」图标：输入栏左下角第二个，约占宽 60%、距底部 6.5%
+        icon_x = int(0.600 * cur_W)
+        icon_y = cur_H - int(0.065 * cur_H)
+        post_click_client_point(hwnd, icon_x, icon_y)
+        time.sleep(0.30)
+        if not _wait_popup(2.5, want=True):
+            log("⚠️ [语音] 文件选择框没有出现，放弃本次发送")
+            return False
+        time.sleep(0.30)
+
+        if not safe_clipboard_copy(os.path.abspath(path), retries=3, delay=0.03):
+            log("⚠️ [语音] 路径写剪贴板失败")
+            _key_combo(0x1B, ctrl=False)   # Esc 关掉文件框
+            return False
+        time.sleep(0.25)
+        _key_combo(0x56)                   # Ctrl+V 粘贴路径
+        time.sleep(0.35)
+        _key_combo(0x0D, ctrl=False)       # Enter 确认选择
+        time.sleep(1.0)
+        if not _wait_popup(2.0, want=False):
+            log("⚠️ [语音] 文件框没关掉（路径可能没被接受），放弃发送")
+            _key_combo(0x1B, ctrl=False)
+            return False
+        time.sleep(0.45)
+        _key_combo(0x0D, ctrl=False)       # Enter 发送附件
+        time.sleep(1.2)
+        log(f"🎙️ [语音] 已发给【{target}】: {os.path.basename(path)}")
+        return True
+    except Exception as e:
+        log(f"⚠️ [语音] 发送异常: {type(e).__name__}: {e}")
+        return False
+    finally:
+        if hidden:
+            time.sleep(0.25)
+            try:
+                lx.hide_window(hwnd)
+            except Exception:
+                pass
+
+
+def _deliver_voices(target, voice_texts, signature, hwnd, rect, layout, cfg, source="agent"):
+    """逐条合成语音并发送；失败只记日志，不重试（避免重复发同一句话）。"""
+    if not voice_texts:
+        return False
+    vcfg = _voice_cfg(cfg)
+    if not vcfg["enabled"]:
+        log("ℹ️ [语音] 收到语音回复，但配置里 voice.enabled=false，跳过合成")
+        return False
+    sent = False
+    for said in voice_texts[:1]:
+        said = str(said or "").strip()
+        if not said:
+            continue
+        if len(said) > vcfg["max_chars"]:
+            said = said[: vcfg["max_chars"]]
+        try:
+            info = voice_tts.synthesize(
+                said,
+                voice=vcfg["voice"],
+                instruction=vcfg["instruction"],
+                fallback_voice=vcfg["edge_voice"],
+                allow_edge_fallback=vcfg["edge_fallback"],
+                timeout=vcfg["timeout"],
+            )
+        except Exception as e:
+            log(f"⚠️ [语音] 合成失败（降级为不发语音）: {e}")
+            continue
+        path = info.get("path") or ""
+        try:
+            ok = False
+            if vcfg.get("mode") == "bubble":
+                ok = _send_voice_bubble(hwnd, layout, target, path, cfg)
+                if not ok and vcfg.get("fallback_file"):
+                    log("ℹ️ [语音] 气泡发送失败，回退成音频文件")
+                    ok = _send_voice_file(hwnd, layout, target, path, cfg)
+            else:
+                ok = _send_voice_file(hwnd, layout, target, path, cfg)
+            if ok:
+                sent = True
+                log(f"🎙️ [语音] 已合成并发送（{info.get('engine')}）: {said[:24]}{'…' if len(said) > 24 else ''}")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        time.sleep(0.5)
+    return sent
+
+
 def poll_agent_results(hwnd, rect=None, layout=None):
     """
     主循环每个心跳调用一次：
@@ -1831,9 +2230,12 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         action = str(decision.get("action") or "reply").lower()
         segments = _decision_segments(decision)
         stickers = _decision_stickers(decision)
+        voices = _decision_voices(decision)
         text = " / ".join(segments)          # 仅用于日志展示
         if stickers:
             text = (text + "  🎨" if text else "🎨").strip()
+        if voices:
+            text = (text + "  🎙️" if text else "🎙️").strip()
         urgency = str(decision.get("urgency") or "now").lower()
         reason = str(decision.get("reason") or "")
         cost = item.get("cost") or 0.0
@@ -1863,14 +2265,14 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         if action == "defer":
             LAST_PROCESSED_SIGNATURE[target] = signature
             delay = client.urgency_to_seconds(urgency) if client else 60.0
-            if segments or stickers:
-                _schedule_outbox(target, segments, signature, delay, "defer", stickers=stickers)
+            if segments or stickers or voices:
+                _schedule_outbox(target, segments, signature, delay, "defer", stickers=stickers, voices=voices)
             else:
                 log(f"⏸️ [Agent 判定稍后再说] 好友【{target}】: {reason}")
             continue
 
         # action == reply
-        if not segments and not stickers:
+        if not segments and not stickers and not voices:
             log(f"⚠️ [Agent 空回复] 好友【{target}】无正文也无表情，跳过")
             LAST_PROCESSED_SIGNATURE[target] = signature
             continue
@@ -1878,7 +2280,7 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         delay = client.urgency_to_seconds(urgency) if client else 0.0
         if delay > 0:
             LAST_PROCESSED_SIGNATURE[target] = signature
-            _schedule_outbox(target, segments, signature, delay, "agent", stickers=stickers)
+            _schedule_outbox(target, segments, signature, delay, "agent", stickers=stickers, voices=voices)
             continue
 
         log(f"💬 [Agent 决策] 好友【{target}】: {text}  (urgency={urgency}, 耗时 {cost:.1f}s)")
@@ -1887,6 +2289,10 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         if stickers:
             time.sleep(0.4)
             if _deliver_stickers(target, stickers, signature, hwnd, rect, layout, cfg, source="agent"):
+                did_send = True
+        if voices:
+            time.sleep(0.4)
+            if _deliver_voices(target, voices, signature, hwnd, rect, layout, cfg, source="agent"):
                 did_send = True
 
     # ---------- 2) 到点的延时队列 ----------
@@ -1908,6 +2314,9 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         pending_stickers = entry.get("stickers") or []
         if pending_stickers and _deliver_stickers(target, pending_stickers, entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
             did_send = True
+        pending_voices = entry.get("voices") or []
+        if pending_voices and _deliver_voices(target, pending_voices, entry["signature"], hwnd, rect, layout, cfg, source=entry.get("source", "outbox")):
+            did_send = True
 
     return did_send
 
@@ -1917,6 +2326,7 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
     action = str((decision or {}).get("action") or "reply").lower()
     segments = _decision_segments(decision)
     stickers = _decision_stickers(decision)
+    voices = _decision_voices(decision)
     text = " / ".join(segments)          # 仅用于日志展示
     urgency = str((decision or {}).get("urgency") or "now").lower()
     reason = str((decision or {}).get("reason") or "")
@@ -1932,7 +2342,7 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
         if segments:
             _schedule_outbox(target, segments, signature, delay, "defer-sync")
         return False
-    if not segments and not stickers:
+    if not segments and not stickers and not voices:
         LAST_PROCESSED_SIGNATURE[target] = signature
         return False
 
@@ -1940,7 +2350,7 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
     delay = client.urgency_to_seconds(urgency) if client else 0.0
     if delay > 0:
         LAST_PROCESSED_SIGNATURE[target] = signature
-        _schedule_outbox(target, segments, signature, delay, "agent-sync", stickers=stickers)
+        _schedule_outbox(target, segments, signature, delay, "agent-sync", stickers=stickers, voices=voices)
         return False
 
     log(f"💬 [Agent 决策·同步] 好友【{target}】: {text}")
@@ -1948,6 +2358,9 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
     if stickers:
         time.sleep(0.4)
         sent = _deliver_stickers(target, stickers, signature, hwnd, rect, layout, cfg, source="agent-sync") or sent
+    if voices:
+        time.sleep(0.4)
+        sent = _deliver_voices(target, voices, signature, hwnd, rect, layout, cfg, source="agent-sync") or sent
     return sent
 
 

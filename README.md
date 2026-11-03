@@ -206,7 +206,7 @@ curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" 
 Agent 返回的契约（一行 JSON）：
 
 ```json
-{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "sticker": "[表情: 得意闭眼拳头] 或 /dsh-memes/dafeiyu-001/memes/happy/deyi.jpg", "urgency": "now|soon|later", "reason": "一句话理由"}
+{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "sticker": "[表情: 得意闭眼拳头] 或 /dsh-memes/dafeiyu-001/memes/happy/deyi.jpg", "voice": "可选：要发一条语音就说这句话", "urgency": "now|soon|later", "reason": "一句话理由"}
 ```
 
 | 字段 | 含义 |
@@ -214,6 +214,7 @@ Agent 返回的契约（一行 JSON）：
 | `action` | `reply` 该回 / `ignore` 不用回 / `defer` 现在不合适 |
 | `segments` | 要**逐条连发**的消息数组（1–4 条，每条 5–30 字，像真人分条发）。只有一条时也可写 `"text": "..."`；老契约的 `text` 继续兼容，`text` 里用 `\|\|\|` 分隔也会被拆开 |
 | `sticker` | 可选，一张表情。当前 DSH 表情插件是 **dsh-meme**，模型会写 `[表情: 描述]`（也可以直接给 `/dsh-memes/...` 路径）。bot 用描述查图库索引换成图片并发出去；老插件的 markdown 图片链接（`![摸鱼](http://…/x-nekowhale-stickers/…)`）继续兼容。也可以只发表情不写字，写在 `segments` 里的表情标记同样会被剥出来 |
+| `voice` | 可选，一条语音要说的文本（20–80 字口语化）；也可在 `segments` 里写 `[语音: 文本]`。bot 会合成音频并通过**虚拟麦克风 + 按住说话**发成真语音气泡（失败可回退成音频文件消息） |
 | `urgency` | `now` 立即 / `soon` 30–90 秒 / `later` 3–15 分钟（带 ±20% 抖动） |
 | `reason` | 一句话理由，只用于日志 |
 
@@ -236,6 +237,78 @@ Agent 返回的契约（一行 JSON）：
 - **Agent 不可用时**：记 ERROR 日志 + 发一条 `fallback_replies` 里的固定可爱回复，不会静默，也不会退回旧的直连模型。
 - **并发**：每个联系人一个 `contextId`，多线程并行决策，互不阻塞。
 - `contextId` 只允许 ASCII，中文昵称会自动哈希成 `wx-u<sha1前12位>`，映射表落在 `wechat_agent_contexts.json`。
+
+### 🎙️ 语音消息（可选，需 dsh-breeze-tts）
+
+Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice": "要说的那句话"`（或在 `segments` 里写
+`[语音: 文本]`），bot 调 DSH 的 **dsh-breeze-tts** 插件合成音频，再用「文件消息」发出去。
+
+> 💡 怎么发出真·语音气泡：WeChat Linux 4.1.x 的语音入口不是输入栏那个麦克风（那个是「语音输入文字」），
+> 而是右侧的 **「发语音」按钮**（悬停提示为「发语音」，窗口宽度约 85.3% 处）。点它后输入栏会变成
+> 「按住说话」条；按住不放、松开即发送。bot 用 **虚拟麦克风** 把合成的音频喂给微信：
+> 临时建 `wx_tts_sink`（空输出）+ `wx_tts_source`（它的 monitor 重映射成录音源），把默认录音设备
+> 切到它，`paplay` 播放 TTS 音频，同时按住说话条，播完松开 → 微信把这段音频当语音消息发出去。
+> 发完自动把默认录音设备切回原物理麦克风。失败时可选回退成「音频文件消息」。
+
+配置（`agent.voice`，缺省关闭）：
+
+```json
+{
+    "agent": {
+        "voice": {
+            "enabled": true,
+            "mode": "bubble",
+            "max_chars": 120,
+            "voice": "",
+            "instruction": "",
+            "edge_fallback": true,
+            "edge_voice": "zh-CN-XiaoxuanNeural",
+            "timeout": 180,
+            "fallback_file": true,
+            "virtual_source": "wx_tts_source",
+            "virtual_sink": "wx_tts_sink",
+            "record_tail": 0.45,
+            "min_record_seconds": 1.2
+        }
+    }
+}
+```
+
+| 键 | 说明 |
+| --- | --- |
+| `enabled` | 总开关，默认 `false`（不打开就不会合成，也不会多花时间） |
+| `max_chars` | 超过这个字数的语音不再合成（省时省钱） |
+| `voice` / `instruction` | 传给 Breeze 的音色 id / 风格指令，留空用默认 |
+| `edge_fallback` | Breeze 服务不可用时，是否退回 edge-tts（`/dsh-breeze-tts-api/speak`） |
+| `edge_voice` | edge-tts 的发音人 |
+| `timeout` | 合成超时（秒） |
+| `mode` | `bubble`（默认，真语音气泡）/ `file`（音频文件消息） |
+| `fallback_file` | 气泡发送失败时是否回退成文件消息 |
+| `virtual_source` / `virtual_sink` | 虚拟麦克风/空输出设备名（两处保持一致即可） |
+| `record_tail` / `min_record_seconds` | 录音尾巴、最短录音时长（微信拒绝太短的语音） |
+
+前置条件：
+
+1. DSH 已安装并启用 **dsh-breeze-tts** 插件（提供 `POST /dsh-breeze-tts-api/speak-preview`，返回 WAV）。
+2. 插件后端有 Breeze-TTS-2 服务：
+   ```bash
+   breeze-server q4_k.gguf --host 127.0.0.1 --port 8080 --webui
+   # 健康检查
+   curl -s http://127.0.0.1:8080/health
+   # 告诉插件端点
+   curl -X PUT http://127.0.0.1:25675/dsh-breeze-tts-api/config \
+        -H 'Content-Type: application/json' -d '{"endpoint":"http://127.0.0.1:8080"}'
+   # 自检：拿到 wav
+   curl -X POST http://127.0.0.1:25675/dsh-breeze-tts-api/speak-preview \
+        -H 'Content-Type: application/json' -d '{"input":"你好"}' -o /tmp/t.wav
+   ```
+3. 微信里有可发送的会话（白名单里的人）。
+
+发送流程：`voice_texts` → `voice_tts.synthesize()`（优先 Breeze，按 magic 判扩展名）→
+顶栏核验并切到目标会话 → 建/复用虚拟麦克风并把默认录音设备切过去 → 点「发语音」→ 按住说话条的同时
+`paplay` 播放合成音频 → 松开自动发送 → 恢复默认录音设备 → 日志 `🎙️ [语音] 已发语音气泡【张三】`。
+离屏隐藏模式下会先临时召回窗口、发完再回到隐藏态；发送前同样核验顶栏，防止发错人。
+需要系统有 `pulseaudio-utils`（提供 `pactl`/`paplay`），Debian 上 `sudo apt install pulseaudio-utils`。
 
 ### 📤 主动发送（可选）
 

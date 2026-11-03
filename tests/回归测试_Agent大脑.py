@@ -80,6 +80,7 @@ _stub("rapidocr_onnxruntime", RapidOCR=_FakeOCR)
 
 import wechat_ai_bot_dev as bot  # noqa: E402
 import agent_client  # noqa: E402
+import voice_tts as _voice_tts  # noqa: E402
 
 fails = []
 LOG_LINES = []
@@ -166,17 +167,17 @@ pc.logger = lambda m: None
 check("标准 JSON",
       pc._parse('{"action":"reply","text":"在的","urgency":"now","reason":"r"}'),
       {"action": "reply", "text": "在的", "segments": ["在的"], "stickers": [],
-       "meme_captions": [], "meme_paths": [], "urgency": "now", "reason": "r"})
+       "meme_captions": [], "meme_paths": [], "voice_texts": [], "urgency": "now", "reason": "r"})
 
 check("markdown 围栏包裹",
       pc._parse('```json\n{"action":"ignore","text":"","urgency":"now","reason":"广告"}\n```'),
       {"action": "ignore", "text": "", "segments": [], "stickers": [],
-       "meme_captions": [], "meme_paths": [], "urgency": "now", "reason": "广告"})
+       "meme_captions": [], "meme_paths": [], "voice_texts": [], "urgency": "now", "reason": "广告"})
 
 check("前后夹带废话",
       pc._parse('好的，我判断如下：\n{"action":"reply","text":"来了","urgency":"soon","reason":"x"}\n以上。'),
       {"action": "reply", "text": "来了", "segments": ["来了"], "stickers": [],
-       "meme_captions": [], "meme_paths": [], "urgency": "soon", "reason": "x"})
+       "meme_captions": [], "meme_paths": [], "voice_texts": [], "urgency": "soon", "reason": "x"})
 
 check("缺 action 但有正文 → reply",
       pc._parse('{"text":"哈哈哈","urgency":"now"}')["action"], "reply")
@@ -706,6 +707,92 @@ check_true("dsh-meme 图片能下载成文件", bool(_meme_file))
 if _meme_file:
     import os as _os
     _os.remove(_meme_file)
+
+
+print("=== 5.7 语音发送解析（voice 字段 / [语音: 文本] 标记）===")
+_clean_v, _said_v = agent_client.split_voice_refs("好呀[语音: 我这就过去哈]")
+check("文字里的[语音:]标记被剥掉", _clean_v, "好呀")
+check("[语音:]里的文本被收集", _said_v, ["我这就过去哈"])
+
+_dv = _plain._parse('{"action":"reply","segments":["晚安啦"],"voice":"我先睡啦，你也早点休息","urgency":"now"}')
+check("JSON voice 字段进 voice_texts", _dv.get("voice_texts"), ["我先睡啦，你也早点休息"])
+check("voice 字段不影响正文", _dv.get("segments"), ["晚安啦"])
+
+_dv2 = _plain._parse('{"action":"reply","segments":["好耶[语音: 这条是语音说的]"]}')
+check("segment 里的[语音:]进 voice_texts", _dv2.get("voice_texts"), ["这条是语音说的"])
+check("[语音:]不会留在正文", _dv2.get("segments"), ["好耶"])
+
+_dv3 = _plain._parse('{"action":"reply","segments":["你好"],"voice":"第一条语音[语音: 第二条语音]"}')
+check("语音最多保留 1 条", len(_dv3.get("voice_texts") or []), 1)
+
+_dv4 = _plain._parse("好呀[语音: 纯文本分支也要剥掉]")
+check_true("非 JSON 输出也能剥语音标记", not any("[语音" in s for s in (_dv4.get("segments") or [])) and _dv4.get("voice_texts") == ["纯文本分支也要剥掉"])
+
+check("_decision_voices 清洗换行", _wb._decision_voices({"voice_texts": ["  你好\n世界  "]}), ["你好 世界"])
+check("_decision_voices 去重后只留 1 条", _wb._decision_voices({"voice_texts": ["a", "a", "b"]}), ["a"])
+_vcfg_default = _wb._voice_cfg({})
+check("语音默认关闭（免得打扰）", _vcfg_default["enabled"], False)
+check("语音默认长度上限", _vcfg_default["max_chars"], 120)
+_vcfg_on = _wb._voice_cfg({"agent": {"voice": {"enabled": True, "max_chars": 60, "voice": "小鲸鱼"}}})
+check("agent.voice.enabled 生效", _vcfg_on["enabled"], True)
+check("agent.voice.max_chars 生效", _vcfg_on["max_chars"], 60)
+check("agent.voice.voice 生效", _vcfg_on["voice"], "小鲸鱼")
+
+
+print("=== 5.8 语音气泡发送路径（虚拟麦克风 + 按住说话）===")
+import wave as _wave
+
+_vb_default = _wb._voice_cfg({})
+check("语音默认走气泡模式", _vb_default["mode"], "bubble")
+check("气泡失败默认回退文件", _vb_default["fallback_file"], True)
+_vb_bad = _wb._voice_cfg({"agent": {"voice": {"mode": "xxx"}}})
+check("非法 mode 回退 bubble", _vb_bad["mode"], "bubble")
+_vb_file = _wb._voice_cfg({"agent": {"voice": {"mode": "file"}}})
+check("可切到 file 模式", _vb_file["mode"], "file")
+
+_icon_pt, _bar_pt = _wb._voice_button_points(1008, 756)
+check("发语音按钮坐标", _icon_pt, (859, 706))
+check("按住说话条坐标", _bar_pt, (770, 700))
+
+_tv = "/tmp/_voice_regress.wav"
+try:
+    with _wave.open(_tv, "wb") as _w:
+        _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(16000)
+        _w.writeframes(b"\x00\x00" * 8000)   # 0.5s
+    check("voice_tts 能读出 wav 时长", round(_voice_tts.duration_seconds(_tv), 1), 0.5)
+finally:
+    try:
+        os.remove(_tv)
+    except OSError:
+        pass
+
+_calls = []
+_orig_synth = _wb.voice_tts.synthesize
+_orig_bubble = _wb._send_voice_bubble
+_orig_file = _wb._send_voice_file
+try:
+    _wb.voice_tts.synthesize = lambda *a, **k: {"path": "/tmp/_fake.wav", "engine": "stub", "ext": ".wav"}
+    _orig_remove = None
+    # 造一个假文件路径，_deliver_voices 的 finally 会 os.remove
+    open("/tmp/_fake.wav", "wb").write(b"RIFF")
+    _wb._send_voice_bubble = lambda hwnd, layout, target, path, cfg=None: (_calls.append("bubble") or True)
+    _wb._send_voice_file = lambda hwnd, layout, target, path, cfg=None: (_calls.append("file") or True)
+    _vb_cfg = {"agent": {"voice": {"enabled": True, "mode": "bubble"}}}
+    check("气泡模式调用 _send_voice_bubble", _wb._deliver_voices("张三", ["你好呀"], "sig", 0, None, None, _vb_cfg), True)
+    check("实际走的是气泡分支", _calls[-1], "bubble")
+    _calls.clear()
+    _wb._send_voice_bubble = lambda *a, **k: (_calls.append("bubble") or False)
+    _wb._deliver_voices("张三", ["你好呀"], "sig", 0, None, None, _vb_cfg)
+    check("气泡失败回退文件消息", _calls, ["bubble", "file"])
+finally:
+    _wb.voice_tts.synthesize = _orig_synth
+    _wb._send_voice_bubble = _orig_bubble
+    _wb._send_voice_file = _orig_file
+    for _p in ("/tmp/_fake.wav",):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
 
 
 # ===========================================================================

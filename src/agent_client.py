@@ -55,7 +55,7 @@ DEFAULT_FALLBACK_REPLIES = [
 
 CONTRACT = """你是微信自动回复代理，代替账号主人回复好友消息。
 只输出一行 JSON，不要 markdown 代码块，不要解释，不要任何多余文字：
-{"action":"reply|ignore|defer","segments":["第一条","第二条"],"urgency":"now|soon|later","reason":"一句话理由"}
+{"action":"reply|ignore|defer","segments":["第一条","第二条"],"voice":"可选：要发一条语音就说这句话","urgency":"now|soon|later","reason":"一句话理由"}
 规则：
 - action=reply：正常回复。segments 是要**连发的 1-3 条消息**，按顺序一条条发出去，像真人连发
   · 每条 5-30 个汉字，一条只说一件事；想说的多就分条，别把一大段挤进一条
@@ -75,6 +75,10 @@ CONTRACT = """你是微信自动回复代理，代替账号主人回复好友消
   · 一条回复最多 1 张表情，别每句都配图；表情标记不要和正文混在同一条里
   · 表情是锦上添花：对方在难过/说正事时不要发表情
   · 注意：即使要发表情，也**只输出那一行 JSON**，绝对不要直接输出聊天文字或裸 markdown
+- 想直接发**语音**时：在 JSON 里加 "voice":"要说的那句话"（不要放进 segments，也不要写成 [语音: ...]）
+  · 什么时候发语音：对方也在发语音、你刚想表达情绪（撒娇/安慰/吐槽一句）、单纯一句话懒得打字
+  · 一条回复最多 1 条语音，**语音和文字不要重复同一个意思**；要么发语音、要么发文字，别两遍
+  · 语音内容 1-2 句、20-80 个汉字，口语化，像真人录的；不要念数字符号（避免读成"井号"）
 - 严禁透露自己是 AI 或机器人"""
 
 # 一次回复最多拆几条：太多会像刷屏，真人连发 1-3 条最自然，留 4 的余量
@@ -92,6 +96,12 @@ STICKER_BARE_RE = re.compile(r"(https?://[^\s)\]\[]+/x-nekowhale-stickers/[^\s)\
 # 描述本身没有 URL，得回来查图库索引才能找到那张图（见 wechat_ai_bot_dev._resolve_meme_caption）。
 MEME_MARK_RE = re.compile(r"\[表情[:：]\s*([^\]\n]{1,80})\]")
 MEME_REL_RE = re.compile(r"(?<![\w/.])/(dsh-memes/[^\s)\]\"'，。、；;]+)")
+
+# 语音：模型可能按契约把语音写进 "voice" 字段，也可能顺手写成「[语音: 文本]」标记。
+# bot 会调 dsh-breeze-tts 合成 wav 再发给对方；一条回复最多 1 条语音。
+MAX_VOICES = 1
+VOICE_MARK_RE = re.compile(r"\[语音[:：]\s*([^\]\n]{1,200})\]")
+VOICE_MARK_BARE_RE = re.compile(r"\[语音\]")
 
 
 def split_meme_refs(text):
@@ -118,6 +128,21 @@ def split_meme_refs(text):
     cleaned = MEME_MARK_RE.sub(take_mark, str(text or ""))
     cleaned = MEME_REL_RE.sub(take_path, cleaned)
     return cleaned, captions, paths
+
+
+def split_voice_refs(text):
+    """把「[语音: 文本]」标记剥出来。返回 (清干净的文字, [语音文本...])。"""
+    said = []
+
+    def take(m):
+        t = str(m.group(1) or "").strip()
+        if t and t not in said:
+            said.append(t)
+        return ""
+
+    cleaned = VOICE_MARK_RE.sub(take, str(text or ""))
+    cleaned = VOICE_MARK_BARE_RE.sub("", cleaned)
+    return cleaned.strip(), said
 
 
 def split_stickers(text):
@@ -697,12 +722,13 @@ class AgentClient(object):
             # 这种输出比走固定兜底话术好得多，能救就救。
             cleaned, found = split_stickers(text)
             cleaned, meme_captions, meme_paths = split_meme_refs(cleaned)
-            if not found and not meme_captions and not meme_paths:
+            cleaned, voice_texts = split_voice_refs(cleaned)
+            if not found and not meme_captions and not meme_paths and not voice_texts:
                 return None
             lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
             segments = [" ".join(lines)] if len(lines) > 1 else lines
             segments = [seg.strip(" \"\u201c\u201d") for seg in segments if seg.strip(" \"\u201c\u201d")]
-            if segments or found or meme_captions or meme_paths:
+            if segments or found or meme_captions or meme_paths or voice_texts:
                 return {
                     "action": "reply",
                     "text": "\n".join(segments),
@@ -710,6 +736,7 @@ class AgentClient(object):
                     "stickers": found[:MAX_STICKERS],
                     "meme_captions": meme_captions[:MAX_STICKERS],
                     "meme_paths": meme_paths[:MAX_STICKERS],
+                    "voice_texts": voice_texts[:MAX_VOICES],
                     "urgency": "now",
                     "reason": "plain_text_reply",
                 }
@@ -723,6 +750,14 @@ class AgentClient(object):
         stickers = []
         meme_captions = []
         meme_paths = []
+        voice_texts = []
+
+        def take_voices(piece):
+            cleaned, said = split_voice_refs(str(piece or ""))
+            for t in said:
+                if t not in voice_texts:
+                    voice_texts.append(t)
+            return cleaned
 
         def take_memes(piece, caption_fallback=False):
             _clean, _urls = split_stickers(str(piece or ""))
@@ -762,9 +797,24 @@ class AgentClient(object):
                     item = item.get("url") or item.get("text") or item.get("path") or ""
                 take_memes(item, caption_fallback=True)
 
+        # 独立字段 "voice"/"voices"（协约推荐写法）
+        explicit_voice = obj.get("voice")
+        if explicit_voice is None:
+            explicit_voice = obj.get("voices")
+        if isinstance(explicit_voice, str):
+            explicit_voice = [explicit_voice]
+        if isinstance(explicit_voice, list):
+            for item in explicit_voice:
+                if isinstance(item, dict):
+                    item = item.get("text") or item.get("say") or ""
+                item = take_voices(item)
+                t = str(item or "").strip()
+                if t and t not in voice_texts:
+                    voice_texts.append(t)
+
         segments = []
         for seg in raw_segments:
-            cleaned = take_memes(seg)
+            cleaned = take_voices(take_memes(seg))
             if cleaned:
                 segments.append(cleaned)
         stickers = stickers[:MAX_STICKERS]
@@ -776,7 +826,7 @@ class AgentClient(object):
             # 模型忘了给 action：有正文就当 reply，没正文就当 ignore
             action = "reply" if segments else "ignore"
 
-        if action == "reply" and not segments and not stickers and not meme_captions and not meme_paths:
+        if action == "reply" and not segments and not stickers and not meme_captions and not meme_paths and not voice_texts:
             # 说要回却既没正文也没表情 —— 视为坏输出，走降级兜底
             return None
         urgency = str(obj.get("urgency") or "").strip().lower()
@@ -791,6 +841,7 @@ class AgentClient(object):
             "stickers": stickers,
             "meme_captions": meme_captions,
             "meme_paths": meme_paths,
+            "voice_texts": voice_texts[:MAX_VOICES],
             "urgency": urgency,
             "reason": reason,
         }

@@ -922,6 +922,37 @@ def click_client(wid, x, y, button=1):
     return True
 
 
+def press_client(wid, x, y, button=1):
+    """在窗口内坐标按下鼠标（不释放），用于「按住说话」这类长按操作。"""
+    rect = window_rect(wid)
+    if rect is None:
+        return False
+    ax, ay = rect.left + int(x), rect.top + int(y)
+    d = dpy()
+    with _LOCK:
+        xtest.fake_input(d, X.MotionNotify, x=ax, y=ay)
+        d.sync()
+        time.sleep(0.05)
+        xtest.fake_input(d, X.ButtonPress, button)
+        d.sync()
+    return True
+
+
+def release_client(wid, x, y, button=1):
+    """释放鼠标（配合 press_client）。"""
+    rect = window_rect(wid)
+    if rect is None:
+        return False
+    ax, ay = rect.left + int(x), rect.top + int(y)
+    d = dpy()
+    with _LOCK:
+        xtest.fake_input(d, X.MotionNotify, x=ax, y=ay)
+        d.sync()
+        xtest.fake_input(d, X.ButtonRelease, button)
+        d.sync()
+    return True
+
+
 # Windows VK → X11 keysym 名
 _VK_MAP = {
     0x08: "BackSpace", 0x09: "Tab", 0x0D: "Return", 0x1B: "Escape",
