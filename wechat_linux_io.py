@@ -19,9 +19,12 @@ Linux（X11）后端：把 wechat_ai_bot_dev.py 里那 12 个 Win32 函数换成
 - 一次性 GTK 进程持有剪贴板时要等它退出（8s+），改成常驻守护后 0.2s。
 - 窗口会被用户/WM 拖动，任何点击前都必须重新取几何。
 """
+import contextlib
+import fcntl
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -314,19 +317,27 @@ def occlusion_ratio(wid, rect=None, threshold=0.02):
 # 原理：Composite 的 RedirectAutomatic 让窗口内容改画到服务器端的离屏 pixmap，
 # 桌面上就看不见它；窗口仍 mapped，所以键盘输入照常，pixmap 也能抓到完整画面。
 #
-# 关键约束（血泪教训）：
+# 硬规则（全是踩出来的）：
 #  1) python-xlib 的 Composite 错误路径会抛字段不全的异常并把 Display 连接弄脏，
 #     之后任何 sync() 都可能永久阻塞 —— 所以 Composite 调用全部放进独立助手进程。
-#  2) redirect / unredirect 必须由**同一个 X 客户端**完成：之前 hide、show 各起一个
-#     一次性子进程，结果 unredirect 直接卡死、窗口永远召回不来（实测 8s 超时）。
-#     因此 hide 时启动常驻守护进程（x11_offscreen.py daemon），抓图与召回都通过
-#     Unix socket 回到同一个客户端执行。
-#  3) 隐藏状态写在 /tmp/wx_bot_offscreen.json，GUI 与 bot 是两个进程也能共享。
+#  2) redirect / unredirect 必须由**同一个 X 客户端**完成，所以 hide 时启动常驻
+#     守护进程（x11_offscreen.py daemon），抓图与召回都通过 Unix socket 回到那个
+#     客户端执行。
+#  3) GUI 和 bot 是两个进程，可能同时点隐藏/召回，bot 还会在隐藏态临时召回窗口切
+#     会话。所有操作都用 /tmp/wx_bot_offscreen.lock 做跨进程 flock 串行化；守护
+#     进程失联时一律走「硬恢复」：SIGKILL 掉它（X 服务器随客户端断开自动撤销自动
+#     重定向）→ 新连接把窗口 configure 回状态文件里保存的几何位置，绝不把窗口卡在
+#     屏幕外。
+#  4) 隐藏状态写在 /tmp/wx_bot_offscreen.json，GUI 与 bot 两个进程共享；文件里的
+#     pid 用来判断守护进程是否还活着。
 _OFFSCREEN_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "x11_offscreen.py")
 _OFFSCREEN_STATE = os.path.join("/tmp", "wx_bot_offscreen.json")
 _OFFSCREEN_SOCKET = os.path.join("/tmp", "wx_bot_offscreen.sock")
 _OFFSCREEN_LOG = os.path.join("/tmp", "wx_bot_offscreen.log")
+_OFFSCREEN_LOCK = os.path.join("/tmp", "wx_bot_offscreen.lock")
 _OFFSCREEN_TIMEOUT = 8.0
+_STALE_RECOVER = {}
+_STALE_LOCK = threading.Lock()
 
 
 def _offscreen_state():
@@ -339,8 +350,20 @@ def _offscreen_state():
 
 
 def _pid_alive(pid):
+    """进程是否还活着；僵尸（已死未回收）算死亡，否则 SIGKILL 后会白等 2 秒。"""
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+    except Exception:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            fields = fh.read().split()
+        if len(fields) > 2 and fields[2] == "Z":
+            return False
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)
         return True
     except Exception:
         return False
@@ -372,7 +395,7 @@ def _send_offscreen(payload, timeout=6.0):
 
 
 def _run_offscreen(*args, timeout=_OFFSCREEN_TIMEOUT):
-    """跑一次一次性助手（只在兜底路径用）：返回 (ok, detail)。"""
+    """跑一次一次性助手（兜底/硬恢复用）：返回 (ok, detail)。"""
     cmd = [sys.executable, _OFFSCREEN_HELPER, *[str(a) for a in args]]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -384,22 +407,39 @@ def _run_offscreen(*args, timeout=_OFFSCREEN_TIMEOUT):
     return True, (proc.stdout or "").strip()
 
 
-def is_hidden(wid):
-    """是否处于离屏隐藏（跨进程共享状态文件）。"""
-    state = _offscreen_state()
+@contextlib.contextmanager
+def _offscreen_lock(timeout=12.0):
+    """跨进程互斥：GUI 与 bot 可能同时 hide/show，同一时刻只允许一个操作。"""
+    fh = None
+    acquired = False
     try:
-        if not (state.get("hidden") and int(state.get("wid", -1)) == int(wid)):
-            return False
-    except Exception:
-        return False
-    pid = state.get("pid")
-    # 守护进程没了：窗口可能还停在离屏状态，保守地仍算"隐藏"，
-    # 让抓图走一次性 pixmap 兜底、避免主循环把离屏窗口当成可点窗口。
-    return True if pid is None else True
+        fh = open(_OFFSCREEN_LOCK, "a+")
+        deadline = time.time() + max(1.0, float(timeout))
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.05)
+        yield acquired
+    finally:
+        if fh is not None:
+            try:
+                if acquired:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 def _probe_offscreen(wid):
-    """问窗口真实状态（一次性助手，只读、跨客户端安全）：{'viewable','redirected','rect'}。"""
+    """问窗口真实状态（一次性助手，只读、跨客户端安全）：{'viewable','offscreen','rect'}。"""
     ok, detail = _run_offscreen("probe", int(wid), timeout=5.0)
     if not ok:
         return {}
@@ -410,50 +450,6 @@ def _probe_offscreen(wid):
         return {}
 
 
-def _write_offscreen_state(wid, hidden, geom=None):
-    try:
-        state = {"wid": int(wid), "hidden": bool(hidden)}
-        if geom is not None:
-            state["geom"] = list(geom)
-        with open(_OFFSCREEN_STATE, "w", encoding="utf-8") as fh:
-            json.dump(state, fh)
-    except Exception:
-        pass
-
-
-def hide_window(wid):
-    """把窗口转入离屏：桌面看不见、不抢焦点，但 bot 仍能抓图/发消息。"""
-    wid = int(wid)
-    if is_hidden(wid):
-        ok, _payload = _send_offscreen({"cmd": "probe"}, timeout=3.0)
-        if ok:
-            return True
-        # 状态说隐藏、但守护进程不在：重启一个（幂等 redirect）
-    try:
-        logf = open(_OFFSCREEN_LOG, "a", encoding="utf-8")
-        proc = subprocess.Popen(
-            [sys.executable, _OFFSCREEN_HELPER, "daemon", str(wid)],
-            stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-            start_new_session=True,
-        )
-    except Exception as exc:
-        print(f"⚠️ [离屏] 启动守护进程失败: {exc!r}", file=sys.stderr)
-        return False
-    deadline = time.time() + 6.0
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break
-        if os.path.exists(_OFFSCREEN_SOCKET):
-            ok, payload = _send_offscreen({"cmd": "probe"}, timeout=2.0)
-            if ok:
-                return True
-        time.sleep(0.15)
-    print("⚠️ [离屏] 守护进程启动失败（细节见 /tmp/wx_bot_offscreen.log）",
-          file=sys.stderr)
-    info = _probe_offscreen(wid)
-    return bool(info.get("offscreen"))
-
-
 def _visible_again(wid):
     """窗口是否真的回到桌面：可见、且不再停在屏幕外。"""
     info = _probe_offscreen(wid)
@@ -462,42 +458,240 @@ def _visible_again(wid):
     return bool(info.get("viewable")) and not info.get("offscreen")
 
 
-def show_window(wid):
-    """把离屏窗口召回桌面原来的位置（通过守护进程，保证同一客户端 unredirect）。"""
-    wid = int(wid)
-    if _visible_again(wid) and not _offscreen_state().get("hidden"):
-        _write_offscreen_state(wid, False)
-        return True
-    ok, payload = _send_offscreen({"cmd": "show"}, timeout=8.0)
-    deadline = time.time() + 4.0
+def _geom_from_state(wid):
+    state = _offscreen_state()
+    if int(state.get("wid", -1)) != int(wid):
+        return None
+    geom = state.get("geom")
+    try:
+        if geom and len(geom) == 4:
+            return [int(v) for v in geom]
+    except Exception:
+        return None
+    return None
+
+
+def _write_offscreen_state(wid, hidden, geom=None):
+    try:
+        old = _offscreen_state()
+        same = int(old.get("wid", -1)) == int(wid)
+        state = {"wid": int(wid), "hidden": bool(hidden)}
+        if geom is not None:
+            state["geom"] = [int(v) for v in geom]
+        elif same and old.get("geom"):
+            state["geom"] = old["geom"]
+        if hidden:
+            # 保留守护进程自己的 pid/socket，is_hidden 才能判断它是否还活着
+            for key in ("pid", "socket"):
+                if same and old.get(key):
+                    state[key] = old[key]
+        with open(_OFFSCREEN_STATE, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except Exception:
+        pass
+
+
+def _remove_offscreen_files():
+    for path in (_OFFSCREEN_SOCKET, _OFFSCREEN_STATE):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _kill_daemon(pid):
+    """SIGTERM（让它自己还原窗口）等不到就 SIGKILL（X 随客户端断开会撤销重定向）。"""
+    try:
+        pid = int(pid)
+    except Exception:
+        return
+    if pid == os.getpid() or not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return
+    deadline = time.time() + 1.0
     while time.time() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        return
+    deadline = time.time() + 0.5
+    while time.time() < deadline and _pid_alive(pid):
+        time.sleep(0.05)
+
+
+def _force_recover_locked(wid, rect=None):
+    """硬恢复（调用方必须已持有 _offscreen_lock）：返回恢复后的几何 [l,t,w,h] 或 None。"""
+    wid = int(wid)
+    state = _offscreen_state()
+    if state.get("pid"):
+        _kill_daemon(state.get("pid"))
+    geom = [int(v) for v in rect] if rect else _geom_from_state(wid)
+    _remove_offscreen_files()
+    info = _probe_offscreen(wid)
+    r = info.get("rect")
+    if not geom:
+        if r and not info.get("offscreen"):
+            geom = [int(v) for v in r]
+        elif r:
+            geom = [100, 100, int(r[2]), int(r[3])]
+        else:
+            geom = [100, 100, 1008, 756]
+    ok, detail = _run_offscreen("restore", wid, *geom, timeout=8.0)
+    _write_offscreen_state(wid, False, geom)
+    if not ok:
+        print(f"⚠️ [离屏] 硬恢复失败: {detail}", file=sys.stderr)
+        return None
+    info = _probe_offscreen(wid)
+    if not info or not info.get("viewable"):
+        print("⚠️ [离屏] 硬恢复后窗口仍不可见", file=sys.stderr)
+        return None
+    return geom
+
+
+def force_recover(wid, rect=None):
+    """硬恢复窗口（GUI 超时兜底 / 外部修复入口）：返回恢复后的几何或 None。"""
+    with _offscreen_lock(12.0) as got:
+        if not got:
+            return None
+        return _force_recover_locked(wid, rect=rect)
+
+
+def _recover_in_background(wid, reason=""):
+    """守护进程失联时后台拉一次硬恢复（节流 3 秒，不阻塞调用方）。"""
+    wid = int(wid)
+    now = time.time()
+    with _STALE_LOCK:
+        if now - _STALE_RECOVER.get(wid, 0) < 3.0:
+            return
+        _STALE_RECOVER[wid] = now
+
+    def _run():
+        try:
+            if force_recover(wid) is not None and reason:
+                print(f"⚠️ [离屏] {reason}，已强制恢复窗口", file=sys.stderr)
+        except Exception as exc:
+            print(f"⚠️ [离屏] 后台硬恢复失败: {exc!r}", file=sys.stderr)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def is_hidden(wid):
+    """是否处于离屏隐藏（跨进程共享状态文件）。"""
+    state = _offscreen_state()
+    try:
+        if not (state.get("hidden") and int(state.get("wid", -1)) == int(wid)):
+            return False
+    except Exception:
+        return False
+    pid = state.get("pid")
+    if pid is None or not _pid_alive(pid):
+        # 状态说隐藏、但守护进程已经不在了：窗口大概率还停在屏外。
+        # 先按隐藏处理（抓图走 pixmap 兜底），同时后台把它拉回桌面。
+        _recover_in_background(wid, "守护进程已不在")
+        return True
+    return True
+
+
+def hide_window(wid):
+    """把窗口转入离屏：桌面看不见、不抢焦点，但 bot 仍能抓图/发消息。"""
+    wid = int(wid)
+    with _offscreen_lock(12.0) as got:
+        if not got:
+            print("⚠️ [离屏] 等锁超时，放弃本次隐藏", file=sys.stderr)
+            return bool(_offscreen_state().get("hidden"))
         state = _offscreen_state()
-        if not state.get("hidden"):
-            break
-        time.sleep(0.1)
-    if _visible_again(wid):
-        _write_offscreen_state(wid, False)
-        return True
-    # 守护进程没响应（被 kill / socket 丢），窗口还在屏幕外：一次性兜底尽力而为
-    _run_offscreen("show", wid, timeout=6.0)
-    if _visible_again(wid):
-        _write_offscreen_state(wid, False)
-        return True
-    print(f"⚠️ [离屏] show 失败: {payload.get('detail') or 'daemon 无响应'}",
-          file=sys.stderr)
-    _write_offscreen_state(wid, True)
-    return False
+        if state.get("hidden") and int(state.get("wid", -1)) == wid:
+            ok, _payload = _send_offscreen({"cmd": "ping"}, timeout=2.0)
+            if ok:
+                return True
+            # 状态说隐藏、守护进程却没了：先把窗口救回桌面，再重新隐藏
+            _force_recover_locked(wid)
+            state = _offscreen_state()
+        pid = state.get("pid")
+        if pid and _pid_alive(pid):
+            _kill_daemon(pid)
+        _remove_offscreen_files()
+        logf = None
+        try:
+            logf = open(_OFFSCREEN_LOG, "a", encoding="utf-8")
+            proc = subprocess.Popen(
+                [sys.executable, _OFFSCREEN_HELPER, "daemon", str(wid)],
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            print(f"⚠️ [离屏] 启动守护进程失败: {exc!r}", file=sys.stderr)
+            return False
+        finally:
+            if logf is not None:
+                try:
+                    logf.close()
+                except Exception:
+                    pass
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            if os.path.exists(_OFFSCREEN_SOCKET):
+                ok, _payload = _send_offscreen({"cmd": "ping"}, timeout=2.0)
+                if ok:
+                    return True
+            time.sleep(0.1)
+        print("⚠️ [离屏] 守护进程启动失败（细节见 /tmp/wx_bot_offscreen.log）",
+              file=sys.stderr)
+        info = _probe_offscreen(wid)
+        return bool(info.get("offscreen"))
+
+
+def show_window(wid, rect=None):
+    """把离屏窗口召回桌面（只信守护进程；失败一律走硬恢复，不做跨客户端 unredirect）。"""
+    wid = int(wid)
+    with _offscreen_lock(12.0) as got:
+        if not got:
+            print("⚠️ [离屏] 等锁超时，放弃本次召回", file=sys.stderr)
+            return False
+        state = _offscreen_state()
+        hidden = bool(state.get("hidden")) and int(state.get("wid", -1)) == wid
+        if not hidden and _visible_again(wid):
+            _write_offscreen_state(wid, False)
+            return True
+        pid = state.get("pid")
+        if hidden and (pid is None or not _pid_alive(pid)):
+            print("⚠️ [离屏] 守护进程失联，走硬恢复", file=sys.stderr)
+            return bool(_force_recover_locked(wid, rect=rect))
+        ok, payload = _send_offscreen({"cmd": "show"}, timeout=5.0)
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if _visible_again(wid):
+                _write_offscreen_state(wid, False)
+                return True
+            time.sleep(0.1)
+        if ok and not payload.get("detail"):
+            _write_offscreen_state(wid, False)
+            return True
+        print(f"⚠️ [离屏] show 失败，改走硬恢复: {payload.get('detail') or 'daemon 无响应'}",
+              file=sys.stderr)
+        return bool(_force_recover_locked(wid, rect=rect))
 
 
 def _grab_hidden(wid):
     """离屏窗口抓图：守护进程读 Composite pixmap 存 PNG；失败时一次性兜底。"""
     wid = int(wid)
     path = os.path.join("/tmp", f"wx_hidden_grab_{wid}.png")
-    ok, payload = _send_offscreen({"cmd": "grab", "path": path}, timeout=6.0)
+    ok = False
+    with _offscreen_lock(8.0) as got:
+        if got:
+            ok, _payload = _send_offscreen({"cmd": "grab", "path": path}, timeout=6.0)
     if not ok:
         ok, _detail = _run_offscreen("grab", wid, path, timeout=6.0)
-        if not ok:
-            return None
+    if not ok:
+        return None
     try:
         img = Image.open(path)
         img.load()

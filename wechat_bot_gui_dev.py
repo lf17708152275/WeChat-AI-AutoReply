@@ -2034,17 +2034,28 @@ class WeChatBotGUI(tk.Tk):
         if getattr(self, "_wx_toggle_busy", False):
             return
         hiding = not lx.is_hidden(hwnd)
+        saved_rect = None
         if hiding:
             rect = lx.window_rect(hwnd)
             if rect is not None and rect.width >= 400 and rect.height >= 300:
-                self.config_data["saved_window_rect"] = [
-                    rect.left, rect.top, rect.width, rect.height]
+                saved_rect = [rect.left, rect.top, rect.width, rect.height]
+                self.config_data["saved_window_rect"] = list(saved_rect)
                 try:
                     self.save_config()
                 except Exception:
                     pass
+        else:
+            raw = self.config_data.get("saved_window_rect")
+            if isinstance(raw, (list, tuple)) and len(raw) == 4:
+                try:
+                    saved_rect = [int(v) for v in raw]
+                except Exception:
+                    saved_rect = None
         self._wx_toggle_busy = True
         self._wx_toggle_result = None
+        self._wx_toggle_started = time.time()
+        self._wx_toggle_recover_ok = False
+        self._wx_toggle_force_recover = False
         try:
             self.btn_hide_wx.configure(state=tk.DISABLED,
                                        text="⏳ 正在隐藏…" if hiding else "⏳ 正在召回…")
@@ -2054,9 +2065,18 @@ class WeChatBotGUI(tk.Tk):
         def _worker():
             ok = False
             try:
-                ok = bool(lx.hide_window(hwnd)) if hiding else bool(lx.show_window(hwnd))
+                ok = bool(lx.hide_window(hwnd)) if hiding else bool(
+                    lx.show_window(hwnd, rect=saved_rect))
             except Exception as exc:  # 子进程/状态文件异常都不该炸 GUI
                 print(f"off-screen toggle failed: {exc!r}", file=sys.stderr)
+            if not ok:
+                # 卡住/失败时的硬恢复：杀掉失联的守护进程，把窗口放回保存的几何位置
+                try:
+                    ok = bool(lx.force_recover(hwnd, rect=saved_rect))
+                    if ok:
+                        self._wx_toggle_recover_ok = True
+                except Exception as exc:
+                    print(f"off-screen recover failed: {exc!r}", file=sys.stderr)
             self._wx_toggle_result = (ok, hiding)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -2067,11 +2087,23 @@ class WeChatBotGUI(tk.Tk):
         result = getattr(self, "_wx_toggle_result", None)
         if result is None:
             if getattr(self, "_wx_toggle_busy", False):
-                self.after(120, self._poll_offscreen_toggle)
+                started = getattr(self, "_wx_toggle_started", 0.0)
+                if started and time.time() - started > 20.0:
+                    # 后台线程彻底卡住：主线程兜底恢复一次，别让按钮永远停在「⏳」
+                    if not getattr(self, "_wx_toggle_force_recover", False):
+                        self._wx_toggle_force_recover = True
+                        self._force_recover_offscreen_async()
+                    if time.time() - started > 28.0:
+                        self._wx_toggle_result = (False, True)
+                        self._wx_toggle_busy = False
+                else:
+                    self.after(120, self._poll_offscreen_toggle)
             return
         self._wx_toggle_result = None
         self._wx_toggle_busy = False
+        self._wx_toggle_force_recover = False
         ok, hiding = result
+        recovered = bool(getattr(self, "_wx_toggle_recover_ok", False))
         hwnd, _ = get_wechat_hwnd()
         hidden_now = bool(hwnd) and lx.is_hidden(hwnd)
         try:
@@ -2084,7 +2116,13 @@ class WeChatBotGUI(tk.Tk):
             messagebox.showerror(
                 "操作失败",
                 "离屏操作超时或失败（细节见程序终端输出）。\n"
-                "微信窗口不受影响，可以稍后再试一次。")
+                "可再点一次按钮重试；若窗口不见了，点「🖥️ 召唤微信回桌面」会强制恢复。")
+            return
+        if recovered:
+            messagebox.showwarning(
+                "已强制恢复",
+                "离屏操作没能在限定时间内完成，已把微信窗口强制恢复回桌面。\n"
+                "现在可以重新点一次「👻 隐藏微信至离屏」重试。")
             return
         if hidden_now:
             messagebox.showinfo(
@@ -2095,6 +2133,30 @@ class WeChatBotGUI(tk.Tk):
                 "点同一个按钮可随时召回微信。")
         else:
             messagebox.showinfo("已召回", "🖥️ 微信已回到桌面并置于最前。")
+
+    def _force_recover_offscreen_async(self):
+        """后台线程里做一次硬恢复（主线程调用，绝不阻塞界面）。"""
+        if not IS_LINUX or lx is None:
+            return
+        hwnd, _ = get_wechat_hwnd()
+        if not hwnd:
+            return
+        raw = self.config_data.get("saved_window_rect")
+        rect = None
+        if isinstance(raw, (list, tuple)) and len(raw) == 4:
+            try:
+                rect = [int(v) for v in raw]
+            except Exception:
+                rect = None
+
+        def _run():
+            try:
+                geom = lx.force_recover(hwnd, rect=rect)
+                print(f"off-screen force recover -> {geom}", file=sys.stderr)
+            except Exception as exc:
+                print(f"off-screen force recover failed: {exc!r}", file=sys.stderr)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def stop_bot(self):
         if getattr(self, "_bot_action_running", False):

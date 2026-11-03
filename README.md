@@ -379,6 +379,14 @@ bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）。�
 > 所以第一次隐藏时会拉起常驻助手 `x11_offscreen.py`（`/tmp/wx_bot_offscreen.sock`），
 > 抓图与召唤都回到这个进程里执行；GUI 与 bot 各自读
 > `/tmp/wx_bot_offscreen.json` 共享隐藏状态，召唤只需 0.2~0.5 秒、不会再卡住。
+>
+> 防卡死加固：GUI 和 bot 是两个进程，都可能隐藏/召回（bot 在隐藏态切会话时还会临时
+> 召回窗口），所以 hide/show/grab 全部用 `/tmp/wx_bot_offscreen.lock` 做跨进程 `flock`
+> 串行化；助手失联（被 kill / 卡住）时走**硬恢复**——SIGTERM→SIGKILL 掉它（X 服务器
+> 会随客户端断开撤销重定向），再用独立连接把窗口 configure 回状态文件里的几何位置。
+> 助手里只有「持有 redirect 的连接」能做 Composite：unredirect 是 `show()` 的**最后
+> 一个** X 调用，之后不再 `sync()`；抓图/移动/重绘都用一次性连接，报错不会污染主连接。
+> GUI 轮询另有 20 秒硬超时，后台线程彻底卡住时主线程也会兜底恢复并把按钮复位。
 
 > 离屏时 Chromium 会降帧渲染，气泡出现可能晚 1~2 秒：发送侧改为多轮轮询，
 > 一旦 Enter 已发出就**绝不重发**（避免给同一个人发两遍）。

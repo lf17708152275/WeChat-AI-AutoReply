@@ -158,10 +158,16 @@ class _FakeLx:
         self.hide_calls += 1
         return True
 
-    def show_window(self, wid):
+    def show_window(self, wid, rect=None):
         self.hidden = False
         self.show_calls += 1
+        self.show_rects = getattr(self, "show_rects", []) + [rect]
         return True
+
+    def force_recover(self, wid, rect=None):
+        self.hidden = False
+        self.recover_calls = getattr(self, "recover_calls", 0) + 1
+        return [80, 120, 1000, 700]
 
     def window_rect(self, wid):
         return _FakeRect(80, 120, 1000, 700)
