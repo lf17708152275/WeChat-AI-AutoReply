@@ -717,7 +717,7 @@ class AgentClient(object):
         meme_captions = []
         meme_paths = []
 
-        def take_memes(piece):
+        def take_memes(piece, caption_fallback=False):
             _clean, _urls = split_stickers(str(piece or ""))
             for url in _urls:
                 if url not in stickers:
@@ -738,6 +738,10 @@ class AgentClient(object):
             elif bare.startswith("/") and ("/dsh-meme" in bare or "/meme" in bare.lower()) and " " not in bare:
                 if bare not in meme_paths:
                     meme_paths.append(bare)
+            if caption_fallback and bare and not bare.lower().startswith(("http://", "https://")):
+                # 模型有时把「描述」直接写进 sticker 字段（忘了 [表情: ] 壳），也当描述处理
+                if not bare.startswith("/") and "[" not in bare and bare not in meme_captions:
+                    meme_captions.append(bare)
             return after_md
 
         explicit = obj.get("sticker")
@@ -749,7 +753,7 @@ class AgentClient(object):
             for item in explicit:
                 if isinstance(item, dict):
                     item = item.get("url") or item.get("text") or item.get("path") or ""
-                take_memes(item)
+                take_memes(item, caption_fallback=True)
 
         segments = []
         for seg in raw_segments:

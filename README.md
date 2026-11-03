@@ -205,14 +205,14 @@ curl -X POST http://127.0.0.1:8765/contacts -H "Content-Type: application/json" 
 Agent 返回的契约（一行 JSON）：
 
 ```json
-{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "sticker": "![摸鱼](http://127.0.0.1:25675/x-nekowhale-stickers/s/xxxx.gif)", "urgency": "now|soon|later", "reason": "一句话理由"}
+{"action": "reply|ignore|defer", "segments": ["第一条", "第二条"], "sticker": "[表情: 得意闭眼拳头] 或 /dsh-memes/dafeiyu-001/memes/happy/deyi.jpg", "urgency": "now|soon|later", "reason": "一句话理由"}
 ```
 
 | 字段 | 含义 |
 | --- | --- |
 | `action` | `reply` 该回 / `ignore` 不用回 / `defer` 现在不合适 |
 | `segments` | 要**逐条连发**的消息数组（1–4 条，每条 5–30 字，像真人分条发）。只有一条时也可写 `"text": "..."`；老契约的 `text` 继续兼容，`text` 里用 `\|\|\|` 分隔也会被拆开 |
-| `sticker` | 可选，一张表情图片的 markdown（来自 DSH 表情插件，形如 `![摸鱼](http://127.0.0.1:25675/x-nekowhale-stickers/s/xxxx.gif)`）。bot 会下载后当图片消息发出；也可以只发表情不写字。写在 `segments` 里的表情 markdown 同样会被剥出来 |
+| `sticker` | 可选，一张表情。当前 DSH 表情插件是 **dsh-meme**，模型会写 `[表情: 描述]`（也可以直接给 `/dsh-memes/...` 路径）。bot 用描述查图库索引换成图片并发出去；老插件的 markdown 图片链接（`![摸鱼](http://…/x-nekowhale-stickers/…)`）继续兼容。也可以只发表情不写字，写在 `segments` 里的表情标记同样会被剥出来 |
 | `urgency` | `now` 立即 / `soon` 30–90 秒 / `later` 3–15 分钟（带 ±20% 抖动） |
 | `reason` | 一句话理由，只用于日志 |
 
@@ -222,9 +222,11 @@ Agent 返回的契约（一行 JSON）：
 | `ignore` | 不发，但记下签名防止重复处理 |
 | `defer` | 整组消息进延时队列，超过 `max_defer_seconds` 放弃 |
 
-- **表情包（表情来自 DSH 的表情插件）**：A2A 会话里的模型可以直接调用 `sticker_search` / `sticker_send`，
-  把工具返回的那行 markdown 放进 `sticker` 字段；bot 只放行本机/局域网表情插件的图片链接，
-  下载后走「复制图片 → Ctrl+V 贴图 → Enter 发送」，离屏隐藏模式下同样能发。一条回复最多 2 张，失败不重发。
+- **表情包（表情来自 DSH 的表情插件）**：A2A 会话里的模型调用 `send_meme`（老插件是 `sticker_search` / `sticker_send`），
+  把候选里的「描述」原样写成 `[表情: 描述]` 放进 `sticker` 字段（或某条 `segments`），也可以直接给候选路径 `/dsh-memes/...`。
+  bot 会查 dsh-meme 图库索引（60 秒缓存）把描述换成图片，只放行本机/局域网表情插件的图片链接，
+  下载后按真实格式判扩展名（webp 会先转 PNG，因为这台机器的 GdkPixbuf 没装 webp loader），
+  再走「复制图片 → Ctrl+V 贴图 → Enter 发送」，离屏隐藏模式下同样能发。一条回复最多 2 张，失败不重发。
 - **契约可自己改**：bot GUI 的「🎭 人设与指令 Prompt」页下半部分就是这段契约的编辑器（默认=内置规则）。
   改完点「💾 保存人设 Prompt + 契约」即写入 `agent.contract`，bot 重启后生效；点「↩️ 恢复内置契约」可还原。
   留空或与内置一致时存空串，跟随程序升级。动态部分（【当前时间】【联系人】【你的人设】【对方刚发来】）仍由 bot 自动拼。

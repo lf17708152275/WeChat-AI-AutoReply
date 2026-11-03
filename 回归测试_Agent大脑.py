@@ -693,6 +693,9 @@ check("[表情:]不会留在正文", _dm.get("segments"), ["好耶"])
 _dm2 = _plain._parse('{"action":"reply","segments":["你看"],"sticker":"/dsh-memes/dafeiyu-001/memes/happy/deyi.jpg"}')
 check("sticker 字段里的表情路径进 meme_paths", _dm2.get("meme_paths"),
       ["/dsh-memes/dafeiyu-001/memes/happy/deyi.jpg"])
+# 模型忘了套 [表情: ] 壳、直接把描述写进 sticker 字段也要兜住
+_dm3 = _plain._parse('{"action":"reply","segments":["好"],"sticker":"%s"}' % _meme_caption)
+check("sticker 字段里的裸描述也能当表情", _dm3.get("meme_captions"), [_meme_caption])
 
 _url_by_caption = _wb._resolve_meme_caption(_meme_caption)
 check_true("描述能在 dsh-meme 图库里查到图", bool(_url_by_caption) and "/dsh-memes/" in _url_by_caption)
