@@ -22,6 +22,7 @@ Linux（X11）后端：把 wechat_ai_bot_dev.py 里那 12 个 Win32 函数换成
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -310,138 +311,204 @@ def occlusion_ratio(wid, rect=None, threshold=0.02):
 # ----------------------------------------------------------------------------
 # 离屏隐藏（XComposite）：把微信窗口转到 off-screen storage
 # ----------------------------------------------------------------------------
-# 原理：XComposite 的 RedirectAutomatic 会把窗口内容改画到服务器端的离屏 pixmap。
-# 本机没有独立的合成器（_NET_WM_CM_S0 无人持有），所以一旦 redirect：
-#   - 桌面上就看不见这个窗口了（用户可正常用电脑，不会被弹窗/抬窗打扰）
-#   - 但窗口仍 mapped，XGetImage 抓它的 pixmap 依然能拿到 100% 真实画面
-#   - 键盘焦点可以用 XSetInputFocus 直接给窗口，Ctrl+V/Enter 照常生效
-# 要用鼠标点窗口内坐标时（切会话/搜索）必须先 show_window 再操作，因为
-# 隐藏时屏幕坐标上根本没有这个窗口，XTest 的鼠标事件会打到别人身上。
-_HIDDEN = set()
-_HIDDEN_GEOM = {}
-_COMPOSITE_OK = None
+# 原理：Composite 的 RedirectAutomatic 让窗口内容改画到服务器端的离屏 pixmap，
+# 桌面上就看不见它；窗口仍 mapped，所以键盘输入照常，pixmap 也能抓到完整画面。
+#
+# 关键约束（血泪教训）：
+#  1) python-xlib 的 Composite 错误路径会抛字段不全的异常并把 Display 连接弄脏，
+#     之后任何 sync() 都可能永久阻塞 —— 所以 Composite 调用全部放进独立助手进程。
+#  2) redirect / unredirect 必须由**同一个 X 客户端**完成：之前 hide、show 各起一个
+#     一次性子进程，结果 unredirect 直接卡死、窗口永远召回不来（实测 8s 超时）。
+#     因此 hide 时启动常驻守护进程（x11_offscreen.py daemon），抓图与召回都通过
+#     Unix socket 回到同一个客户端执行。
+#  3) 隐藏状态写在 /tmp/wx_bot_offscreen.json，GUI 与 bot 是两个进程也能共享。
+_OFFSCREEN_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "x11_offscreen.py")
+_OFFSCREEN_STATE = os.path.join("/tmp", "wx_bot_offscreen.json")
+_OFFSCREEN_SOCKET = os.path.join("/tmp", "wx_bot_offscreen.sock")
+_OFFSCREEN_LOG = os.path.join("/tmp", "wx_bot_offscreen.log")
+_OFFSCREEN_TIMEOUT = 8.0
 
 
-def _composite_ok():
-    global _COMPOSITE_OK
-    if _COMPOSITE_OK is None:
+def _offscreen_state():
+    try:
+        with open(_OFFSCREEN_STATE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _send_offscreen(payload, timeout=6.0):
+    """给离屏守护进程发一条 JSON 命令：返回 (ok, dict)。"""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(float(timeout))
         try:
-            _COMPOSITE_OK = dpy().query_extension("Composite") is not None
-        except Exception:
-            _COMPOSITE_OK = False
-    return bool(_COMPOSITE_OK)
+            sock.connect(_OFFSCREEN_SOCKET)
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            sock.close()
+        line = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+        data = json.loads(line) if line else {}
+        if not isinstance(data, dict):
+            return False, {"detail": "bad reply"}
+        return bool(data.get("ok")), data
+    except Exception as exc:
+        return False, {"detail": repr(exc)}
+
+
+def _run_offscreen(*args, timeout=_OFFSCREEN_TIMEOUT):
+    """跑一次一次性助手（只在兜底路径用）：返回 (ok, detail)。"""
+    cmd = [sys.executable, _OFFSCREEN_HELPER, *[str(a) for a in args]]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:
+        return False, f"helper failed: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        return False, detail
+    return True, (proc.stdout or "").strip()
 
 
 def is_hidden(wid):
-    return int(wid) in _HIDDEN
-
-
-def _repaint_desktop_region(x, y, width, height):
-    """强制桌面把某块区域重画一遍（窗口离开屏幕后，旧像素不会自己消失）。"""
+    """是否处于离屏隐藏（跨进程共享状态文件）。"""
+    state = _offscreen_state()
     try:
-        with _LOCK:
-            d = dpy()
-            d.set_error_handler(lambda *a, **k: None)   # 桌面窗可能拒绝 ClearArea，静默跳过
-            root = d.screen().root
-            for child in root.query_tree().children:
-                try:
-                    cls = _wm_class(child)
-                    if not cls:
-                        continue
-                    name = (cls[0] if isinstance(cls, (tuple, list)) else str(cls)).lower()
-                    if 'desktop' in name:
-                        child.clear_area(int(x), int(y), int(width), int(height), True)
-                        d.sync()
-                        return True
-                except Exception:
-                    continue
+        if not (state.get("hidden") and int(state.get("wid", -1)) == int(wid)):
+            return False
+    except Exception:
+        return False
+    pid = state.get("pid")
+    # 守护进程没了：窗口可能还停在离屏状态，保守地仍算"隐藏"，
+    # 让抓图走一次性 pixmap 兜底、避免主循环把离屏窗口当成可点窗口。
+    return True if pid is None else True
+
+
+def _probe_offscreen(wid):
+    """问窗口真实状态（一次性助手，只读、跨客户端安全）：{'viewable','redirected','rect'}。"""
+    ok, detail = _run_offscreen("probe", int(wid), timeout=5.0)
+    if not ok:
+        return {}
+    try:
+        data = json.loads(detail or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_offscreen_state(wid, hidden, geom=None):
+    try:
+        state = {"wid": int(wid), "hidden": bool(hidden)}
+        if geom is not None:
+            state["geom"] = list(geom)
+        with open(_OFFSCREEN_STATE, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
     except Exception:
         pass
-    finally:
-        try:
-            dpy().set_error_handler(None)
-        except Exception:
-            pass
-    return False
 
 
 def hide_window(wid):
-    """把窗口转入离屏：桌面看不见、不抢焦点，但 bot 仍能抓图/发消息。
-
-    做法是 Composite 重定向（内容改画到服务器端 pixmap）+ 把窗口移到屏幕外，
-    再把原位置的桌面重画一遍（纯重定向会留下旧像素，看起来像还开着）。
-    """
+    """把窗口转入离屏：桌面看不见、不抢焦点，但 bot 仍能抓图/发消息。"""
     wid = int(wid)
-    if wid in _HIDDEN:
-        return True
-    if not _composite_ok():
-        return False
+    if is_hidden(wid):
+        ok, _payload = _send_offscreen({"cmd": "probe"}, timeout=3.0)
+        if ok:
+            return True
+        # 状态说隐藏、但守护进程不在：重启一个（幂等 redirect）
     try:
-        from Xlib.ext import composite
-        with _LOCK:
-            d = dpy()
-            screen = d.screen()
-            w = d.create_resource_object("window", wid)
-            rect = window_rect(wid)
-            if rect is None or rect.width <= 1 or rect.height <= 1:
-                return False
-            _HIDDEN_GEOM[wid] = (rect.left, rect.top, rect.width, rect.height)
-            w.composite_redirect_window(composite.RedirectAutomatic)
-            d.sync()
-            w.configure(x=screen.width_in_pixels + 400, y=rect.top,
-                        width=rect.width, height=rect.height)
-            d.sync()
-            _HIDDEN.add(wid)
-        _repaint_desktop_region(rect.left, rect.top, rect.width, rect.height)
-        return True
-    except Exception:
-        _HIDDEN.discard(wid)
-        _HIDDEN_GEOM.pop(wid, None)
+        logf = open(_OFFSCREEN_LOG, "a", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, _OFFSCREEN_HELPER, "daemon", str(wid)],
+            stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        print(f"⚠️ [离屏] 启动守护进程失败: {exc!r}", file=sys.stderr)
         return False
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        if os.path.exists(_OFFSCREEN_SOCKET):
+            ok, payload = _send_offscreen({"cmd": "probe"}, timeout=2.0)
+            if ok:
+                return True
+        time.sleep(0.15)
+    print("⚠️ [离屏] 守护进程启动失败（细节见 /tmp/wx_bot_offscreen.log）",
+          file=sys.stderr)
+    info = _probe_offscreen(wid)
+    return bool(info.get("offscreen"))
+
+
+def _visible_again(wid):
+    """窗口是否真的回到桌面：可见、且不再停在屏幕外。"""
+    info = _probe_offscreen(wid)
+    if not info:
+        return False
+    return bool(info.get("viewable")) and not info.get("offscreen")
 
 
 def show_window(wid):
-    """把离屏窗口召回桌面原来的位置。"""
+    """把离屏窗口召回桌面原来的位置（通过守护进程，保证同一客户端 unredirect）。"""
     wid = int(wid)
-    if wid not in _HIDDEN:
+    if _visible_again(wid) and not _offscreen_state().get("hidden"):
+        _write_offscreen_state(wid, False)
         return True
-    geom = _HIDDEN_GEOM.pop(wid, None)
-    try:
-        from Xlib.ext import composite
-        with _LOCK:
-            d = dpy()
-            w = d.create_resource_object("window", wid)
-            if geom is not None:
-                x, y, width, height = geom
-                w.configure(x=int(x), y=int(y), width=int(width), height=int(height))
-                d.sync()
-            w.composite_unredirect_window(composite.RedirectAutomatic)
-            d.sync()
-        _HIDDEN.discard(wid)
-        if geom is not None:
-            ret = window_rect(wid)
-            if ret is not None:
-                _repaint_desktop_region(ret.left, ret.top, ret.width, ret.height)
+    ok, payload = _send_offscreen({"cmd": "show"}, timeout=8.0)
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        state = _offscreen_state()
+        if not state.get("hidden"):
+            break
+        time.sleep(0.1)
+    if _visible_again(wid):
+        _write_offscreen_state(wid, False)
         return True
-    except Exception:
-        return False
+    # 守护进程没响应（被 kill / socket 丢），窗口还在屏幕外：一次性兜底尽力而为
+    _run_offscreen("show", wid, timeout=6.0)
+    if _visible_again(wid):
+        _write_offscreen_state(wid, False)
+        return True
+    print(f"⚠️ [离屏] show 失败: {payload.get('detail') or 'daemon 无响应'}",
+          file=sys.stderr)
+    _write_offscreen_state(wid, True)
+    return False
 
 
 def _grab_hidden(wid):
-    """离屏窗口抓图：直接用 Composite pixmap（不受遮挡/屏幕位置影响）。"""
-    from Xlib.ext import composite
-    with _LOCK:
-        d = dpy()
-        w = d.create_resource_object("window", int(wid))
-        g = w.get_geometry()
-        if g.width <= 1 or g.height <= 1:
+    """离屏窗口抓图：守护进程读 Composite pixmap 存 PNG；失败时一次性兜底。"""
+    wid = int(wid)
+    path = os.path.join("/tmp", f"wx_hidden_grab_{wid}.png")
+    ok, payload = _send_offscreen({"cmd": "grab", "path": path}, timeout=6.0)
+    if not ok:
+        ok, _detail = _run_offscreen("grab", wid, path, timeout=6.0)
+        if not ok:
             return None
-        pix = w.composite_name_window_pixmap()
-        raw = pix.get_image(0, 0, g.width, g.height, X.ZPixmap, 0xffffffff).data
-    if len(raw) != g.width * g.height * 4:
+    try:
+        img = Image.open(path)
+        img.load()
+        return img.convert("RGB")
+    except Exception:
         return None
-    # xrdp 下 ZPixmap depth24 的实际字节序是 BGRX
-    return Image.frombytes("RGB", (g.width, g.height), raw, "raw", "BGRX")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def set_window_geometry(wid, x, y, width, height):
@@ -476,9 +543,12 @@ def grab_window(wid, retries=2):
     scr = d.screen()
     wid = int(wid)
     if is_hidden(wid):
-        # 离屏模式：看不见但抓得到，完全不碰窗口层级/焦点
+        # 离屏模式：看不见但抓得到，完全不碰窗口层级/焦点。
+        # 抓不到说明状态文件过期（窗口其实已经召回）→ 落到普通抓图路径。
         img = _grab_hidden(wid)
-        return img, window_rect(wid), 1.0
+        if img is not None:
+            return img, window_rect(wid), 1.0
+        _write_offscreen_state(wid, False)
     if not is_viewable(wid):
         ensure_visible(wid)
 

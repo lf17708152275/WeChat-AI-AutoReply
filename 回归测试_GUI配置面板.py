@@ -7,6 +7,7 @@
 - 保存后必须保留界面上没暴露的 agent 子键（card_url / retries / context_map_file…）
 """
 import json
+import time
 import os
 import shutil
 import sys
@@ -160,6 +161,7 @@ class _FakeLx:
     def show_window(self, wid):
         self.hidden = False
         self.show_calls += 1
+        return True
 
     def window_rect(self, wid):
         return _FakeRect(80, 120, 1000, 700)
@@ -178,20 +180,36 @@ gui.lx = _fake_lx
 gui.get_wechat_hwnd = lambda: (424242, 4)
 gui.messagebox.showinfo = lambda *a, **k: _offscreen_msgs.append(("info", a[0] if a else ""))
 gui.messagebox.showerror = lambda *a, **k: _offscreen_msgs.append(("error", a[0] if a else ""))
+
+
+def _pump_toggle(timeout=3.0):
+    """离屏切换在后台线程跑 X 操作、再 after(0) 回主线程；测试要泵一会儿事件。"""
+    deadline = time.time() + timeout
+    app.update()
+    while time.time() < deadline:
+        if not getattr(app, "_wx_toggle_busy", False):
+            app.update()
+            return True
+        time.sleep(0.02)
+        app.update()
+    return False
+
+
 try:
     app.toggle_offscreen_wechat()
-    app.update()
+    check_true("离屏切换在后台线程完成后回到主线程", _pump_toggle())
     check("离屏隐藏调用 hide_window", _fake_lx.hide_calls, 1)
     check("按钮文案切到「召唤微信回桌面」",
           "召唤" in str(app.btn_hide_wx.cget("text")), True)
     check("隐藏前记录了窗口几何", list(app.config_data.get("saved_window_rect") or [])[:2], [80, 120])
     app.toggle_offscreen_wechat()
-    app.update()
+    check_true("召回操作也能正常完成", _pump_toggle())
     check("再次点击召回（show_window）", _fake_lx.show_calls, 1)
-    check("召回时把窗口摆回记录的几何", _fake_lx.geom_calls, [(80, 120, 1000, 700)])
     check("按钮文案恢复「隐藏微信至离屏」",
           "隐藏" in str(app.btn_hide_wx.cget("text")), True)
     check_true("两次切换都有提示弹窗", len(_offscreen_msgs) == 2)
+    check_true("隐藏/召回期间不会把 GUI 卡在 DISABLED",
+               str(app.btn_hide_wx.cget("state")) != "disabled")
 finally:
     gui.lx = _orig_lx
     gui.get_wechat_hwnd = _orig_hwnd

@@ -1212,6 +1212,7 @@ class WeChatBotGUI(tk.Tk):
         self.spin_pro_hour.set(pc.get("max_per_hour") or 3)
         self.spin_pro_day.set(pc.get("max_per_day") or 20)
         self._safe_after(800, self.refresh_proactive_status)
+        self._sync_offscreen_button()
 
     def save_ui_to_config(self, show_msg=True):
         self.config_data["ai_engine"] = self.var_engine.get()
@@ -1915,53 +1916,100 @@ class WeChatBotGUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", f"切换离屏状态失败: {e}")
 
+    def _sync_offscreen_button(self):
+        """启动时同步离屏按钮文案：上次退出时微信若还在隐藏，这里显示「召唤」。"""
+        if not IS_LINUX or lx is None:
+            return
+        try:
+            hwnd, _ = get_wechat_hwnd()
+            hidden = bool(hwnd) and lx.is_hidden(hwnd)
+            self.btn_hide_wx.configure(
+                text="🖥️ 召唤微信回桌面" if hidden else "👻 隐藏微信至离屏")
+        except Exception:
+            pass
+
     def _toggle_offscreen_wechat_linux(self):
         """Linux：XComposite 离屏重定向——桌面看不见，但 bot 抓图/OCR/发消息照旧。
 
-        与 Windows 版 -3000,-3000 的区别：X11 下窗口移到屏幕外会抓不到画面，
-        所以用 Composite 把窗口内容改画到服务器端 offscreen pixmap；窗口仍在
-        mapped 状态，键盘焦点可以直接给它，因此发送走"只给焦点、不抬窗"。
-        注意：这时用鼠标点窗口内坐标会打到别的窗口上，所以 bot 只在需要切换
-        会话时临时召回窗口，切完立刻重新隐藏。
+        真正的 X 调用在常驻守护进程 x11_offscreen.py 里（python-xlib 的 Composite
+        异常会弄脏共享连接、把 GUI 卡死；且 redirect/unredirect 必须是同一个
+        客户端），GUI 只经 Unix socket 发命令。网络/等待放在后台线程，主线程用
+        after() 轮询结果——这样 8 秒超时也只报错、不会冻结界面。
+
+        注意：所有 python-xlib 调用（window_rect 等）留在主线程做（Display 不是
+        线程安全的），后台线程只调用走子进程/socket 的 hide_window/show_window。
         """
-        try:
-            if lx is None:
-                messagebox.showerror("错误", "wechat_linux_io 不可用，无法使用离屏隐藏。")
-                return
-            hwnd, _ = get_wechat_hwnd()
-            if not hwnd:
-                messagebox.showwarning("提示", "未检测到微信窗口！请先打开微信。")
-                return
-            if lx.is_hidden(hwnd):
-                lx.show_window(hwnd)
-                saved = self.config_data.get("saved_window_rect") or [100, 100, 1100, 750]
+        if lx is None:
+            messagebox.showerror("错误", "wechat_linux_io 不可用，无法使用离屏隐藏。")
+            return
+        hwnd, _ = get_wechat_hwnd()
+        if not hwnd:
+            messagebox.showwarning("提示", "未检测到微信窗口！请先打开微信。")
+            return
+        if getattr(self, "_wx_toggle_busy", False):
+            return
+        hiding = not lx.is_hidden(hwnd)
+        if hiding:
+            rect = lx.window_rect(hwnd)
+            if rect is not None and rect.width >= 400 and rect.height >= 300:
+                self.config_data["saved_window_rect"] = [
+                    rect.left, rect.top, rect.width, rect.height]
                 try:
-                    x, y, w, h = [int(v) for v in list(saved)[:4]]
-                except Exception:
-                    x, y, w, h = 100, 100, 1100, 750
-                sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-                if not (0 <= x <= max(0, sw - 200) and 0 <= y <= max(0, sh - 200)):
-                    x = max(50, (sw - w) // 2)
-                    y = max(50, (sh - h) // 2)
-                lx.set_window_geometry(hwnd, x, y, w, h)
-                self.btn_hide_wx.configure(text="👻 隐藏微信至离屏")
-                messagebox.showinfo("已召回", f"🖥️ 微信已回到桌面：({x}, {y})，{w}×{h}")
-            else:
-                rect = lx.window_rect(hwnd)
-                if rect.width >= 400 and rect.height >= 300:
-                    self.config_data["saved_window_rect"] = [rect.left, rect.top, rect.width, rect.height]
                     self.save_config()
-                if not lx.hide_window(hwnd):
-                    messagebox.showerror("错误", "当前 X 服务器不支持 Composite 离屏重定向，无法隐藏微信。")
-                    return
-                self.btn_hide_wx.configure(text="🖥️ 召唤微信回桌面")
-                messagebox.showinfo(
-                    "已隐藏",
-                    "👻 微信已转入离屏隐藏（桌面不再显示，也不抢焦点）。\n\n"
-                    "AI 守护进程仍可抓图/OCR/发消息；\n需要切换会话时会短暂召回一下，切完自动藏回。\n"
-                    "点同一个按钮可随时召回微信。")
-        except Exception as e:
-            messagebox.showerror("错误", f"切换离屏状态失败: {e}")
+                except Exception:
+                    pass
+        self._wx_toggle_busy = True
+        self._wx_toggle_result = None
+        try:
+            self.btn_hide_wx.configure(state=tk.DISABLED,
+                                       text="⏳ 正在隐藏…" if hiding else "⏳ 正在召回…")
+        except Exception:
+            pass
+
+        def _worker():
+            ok = False
+            try:
+                ok = bool(lx.hide_window(hwnd)) if hiding else bool(lx.show_window(hwnd))
+            except Exception as exc:  # 子进程/状态文件异常都不该炸 GUI
+                print(f"off-screen toggle failed: {exc!r}", file=sys.stderr)
+            self._wx_toggle_result = (ok, hiding)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self.after(120, self._poll_offscreen_toggle)
+
+    def _poll_offscreen_toggle(self):
+        """主线程轮询后台离屏操作结果（避免在子线程碰 Tk）。"""
+        result = getattr(self, "_wx_toggle_result", None)
+        if result is None:
+            if getattr(self, "_wx_toggle_busy", False):
+                self.after(120, self._poll_offscreen_toggle)
+            return
+        self._wx_toggle_result = None
+        self._wx_toggle_busy = False
+        ok, hiding = result
+        hwnd, _ = get_wechat_hwnd()
+        hidden_now = bool(hwnd) and lx.is_hidden(hwnd)
+        try:
+            self.btn_hide_wx.configure(
+                state=tk.NORMAL,
+                text="🖥️ 召唤微信回桌面" if hidden_now else "👻 隐藏微信至离屏")
+        except Exception:
+            pass
+        if not ok:
+            messagebox.showerror(
+                "操作失败",
+                "离屏操作超时或失败（细节见程序终端输出）。\n"
+                "微信窗口不受影响，可以稍后再试一次。")
+            return
+        if hidden_now:
+            messagebox.showinfo(
+                "已隐藏",
+                "👻 微信已转入离屏隐藏（桌面不再显示，也不抢焦点）。\n\n"
+                "AI 守护进程仍可抓图/OCR/发消息；\n"
+                "需要切换会话时会短暂召回一下，切完自动藏回。\n"
+                "点同一个按钮可随时召回微信。")
+        else:
+            messagebox.showinfo("已召回", "🖥️ 微信已回到桌面并置于最前。")
 
     def stop_bot(self):
         if getattr(self, "_bot_action_running", False):

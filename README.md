@@ -371,6 +371,12 @@ bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）。�
 切完自动藏回去。依赖 X 服务器的 Composite 扩展（xrdp 的 Xorg、Xvfb 都自带），
 不支持时会明确报错而不是静默失败。窗口几何记在 `wechat_config_dev.json` 的 `saved_window_rect`。
 
+> 实现细节：Composite 的 redirect / unredirect 必须由**同一个 X 客户端**成对完成，
+> 而 python-xlib 的 Composite 错误路径会弄脏连接、让之后的 `sync()` 永久阻塞。
+> 所以第一次隐藏时会拉起常驻助手 `x11_offscreen.py`（`/tmp/wx_bot_offscreen.sock`），
+> 抓图与召唤都回到这个进程里执行；GUI 与 bot 各自读
+> `/tmp/wx_bot_offscreen.json` 共享隐藏状态，召唤只需 0.2~0.5 秒、不会再卡住。
+
 > 离屏时 Chromium 会降帧渲染，气泡出现可能晚 1~2 秒：发送侧改为多轮轮询，
 > 一旦 Enter 已发出就**绝不重发**（避免给同一个人发两遍）。
 
