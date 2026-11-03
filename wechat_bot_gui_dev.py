@@ -626,8 +626,15 @@ class WeChatBotGUI(tk.Tk):
 
     # 2. TAB: Prompt
     def build_tab_prompt(self):
-        top_p = ttk.Frame(self.tab_prompt)
-        top_p.pack(fill=tk.X, pady=(0, 8))
+        # 上下两栏可拖动：上=旧直连模型的人设 Prompt，下=A2A 决策契约（两栏各自滚动）
+        pane = ttk.Panedwindow(self.tab_prompt, orient=tk.VERTICAL)
+        pane.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(pane, padding=(0, 0, 0, 4))
+        pane.add(top, weight=1)
+
+        top_p = ttk.Frame(top)
+        top_p.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Label(top_p, text="🎭 预设人设风格:", font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
         self.cbo_presets = ttk.Combobox(top_p, values=list(DEFAULT_PROMPTS.keys()), state="readonly", width=24)
@@ -635,15 +642,82 @@ class WeChatBotGUI(tk.Tk):
         self.cbo_presets.pack(side=tk.LEFT, padx=(0, 10))
         self.cbo_presets.bind("<<ComboboxSelected>>", self.on_preset_change)
 
-        ttk.Label(top_p, text="💡 提示: 选择上方预设后，可直接在下方编辑框进行深度定制微调。", foreground="#666666", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+        ttk.Label(
+            top_p,
+            text="💡 选预设后可下方微调；A2A 大脑走的是下面「决策契约」，上面的 Prompt 只给旧直连模型兜底。",
+            foreground="#666666", font=("微软雅黑", 8),
+        ).pack(side=tk.LEFT)
 
-        self.txt_prompt = scrolledtext.ScrolledText(self.tab_prompt, wrap=tk.WORD, height=14, font=("微软雅黑", 9))
-        self.txt_prompt.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.txt_prompt = scrolledtext.ScrolledText(top, wrap=tk.WORD, height=7, font=("微软雅黑", 9))
+        self.txt_prompt.pack(fill=tk.BOTH, expand=True, pady=2)
         self.txt_prompt.bind("<KeyRelease>", self.on_prompt_text_change)
 
+        # ---- A2A 决策契约：发给 DSH 的「规则 + 输出 JSON 格式」----------------
+        box_contract = ttk.LabelFrame(
+            pane, text=" 🤖 A2A 决策契约（发给 DSH 的规则，可编辑） ", padding=(8, 6))
+        pane.add(box_contract, weight=2)
+
+        bar_contract = ttk.Frame(box_contract)
+        bar_contract.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(
+            bar_contract,
+            text="模型按这段规则决定 reply/ignore/defer 并输出 JSON；留空/恢复默认 = 用内置契约。",
+            foreground="#666666", font=("微软雅黑", 8),
+        ).pack(side=tk.LEFT)
+        ttk.Button(bar_contract, text="↩️ 恢复内置契约", command=self.reset_contract).pack(side=tk.RIGHT)
+
+        row_persona = ttk.Frame(box_contract)
+        row_persona.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(row_persona, text="👤 【你的人设】兜底句：", font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        self.var_persona_hint = tk.StringVar()
+        self.ent_persona_hint = ttk.Entry(row_persona, textvariable=self.var_persona_hint)
+        self.ent_persona_hint.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+        ttk.Label(row_persona, text="空 = 默认（正式人设仍由 DSH 人格卡提供）",
+                  foreground="#666666", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+
+        self.txt_contract = scrolledtext.ScrolledText(
+            box_contract, wrap=tk.WORD, height=10, font=("Consolas", 9))
+        self.txt_contract.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+
         btn_p = ttk.Frame(self.tab_prompt)
-        btn_p.pack(fill=tk.X, pady=8)
-        ttk.Button(btn_p, text="💾 保存人设 Prompt", command=self.save_ui_to_config).pack(side=tk.RIGHT)
+        btn_p.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_p, text="💾 保存人设 Prompt + 契约", command=self.save_ui_to_config).pack(side=tk.RIGHT)
+
+    # ---- A2A 决策契约 ----------------------------------------------------
+    def _builtin_contract_text(self):
+        """内置契约（agent_client.CONTRACT）；导入失败时退回空串。"""
+        try:
+            if WORKSPACE_DIR not in sys.path:
+                sys.path.insert(0, WORKSPACE_DIR)
+            import agent_client
+            return str(getattr(agent_client, "CONTRACT", "") or "").strip()
+        except Exception:
+            return ""
+
+    def _contract_text_from_config(self):
+        agent = self.config_data.get("agent") or {}
+        custom = str(agent.get("contract") or "").strip()
+        return custom or self._builtin_contract_text()
+
+    def _contract_override(self):
+        """返回要写进配置的 contract：与内置契约相同（或空）时存 ""，让将来升级内置契约时能跟上。"""
+        try:
+            text = self.txt_contract.get("1.0", tk.END).strip()
+        except Exception:
+            return ""
+        if not text:
+            return ""
+        default = self._builtin_contract_text()
+        return "" if text == default else text
+
+    def reset_contract(self):
+        default = self._builtin_contract_text()
+        try:
+            self.txt_contract.delete("1.0", tk.END)
+            self.txt_contract.insert("1.0", default)
+        except Exception:
+            return
+        messagebox.showinfo("已恢复", "已恢复内置契约。点「💾 保存人设 Prompt + 契约」后生效。")
 
     def _relation_choices(self):
         """关系下拉候选：来自「A2A 关系路由」表（保证和端点配置一一对应），
@@ -1169,6 +1243,11 @@ class WeChatBotGUI(tk.Tk):
             self.config_data["custom_prompt"] = sys_prompt
         elif "custom_prompt" not in self.config_data:
             self.config_data["custom_prompt"] = c.get("custom_prompt", DEFAULT_PROMPTS["✏️ 自由定制"])
+        if hasattr(self, "txt_contract"):
+            self.txt_contract.delete("1.0", tk.END)
+            self.txt_contract.insert("1.0", self._contract_text_from_config())
+        if hasattr(self, "var_persona_hint"):
+            self.var_persona_hint.set(str((c.get("agent") or {}).get("persona_hint") or "").strip())
 
         self.var_wl_mode.set(c.get("whitelist_mode", True))
         self.listbox_wl.delete(0, tk.END)
@@ -1244,6 +1323,9 @@ class WeChatBotGUI(tk.Tk):
         # Agent 大脑：保留配置里其它未在界面暴露的键（card_url / retries / context_map_file…）
         agent_merged = dict(self.config_data.get("agent") or {})
         agent_merged.update(self._agent_cfg_dict())
+        agent_merged["contract"] = self._contract_override()
+        agent_merged["persona_hint"] = (self.var_persona_hint.get().strip()
+                                        if hasattr(self, "var_persona_hint") else "")
         self.config_data["agent"] = agent_merged
 
         proactive_merged = dict(self.config_data.get("proactive_send") or {})
@@ -1465,6 +1547,9 @@ class WeChatBotGUI(tk.Tk):
             "max_defer_seconds": defer_v,
             "fallback_replies": fallbacks or ["嘿嘿，我这会儿有点懵，等下再聊~"],
             "relation_urls": self._relation_url_map(),
+            "contract": self._contract_override(),
+            "persona_hint": (self.var_persona_hint.get().strip()
+                             if hasattr(self, "var_persona_hint") else ""),
         }
 
     def _proactive_cfg_dict(self):

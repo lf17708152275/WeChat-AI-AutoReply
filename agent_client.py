@@ -180,12 +180,17 @@ URGENCY_SET = {"now", "soon", "later"}
 # =============================================================================
 # 工具函数
 # =============================================================================
-def build_prompt(sender, message, persona="", now_time=None):
-    """拼出这一轮发给 agent 的完整文本（含契约 + 上下文）。"""
+def build_prompt(sender, message, persona="", now_time=None, contract=None):
+    """拼出这一轮发给 agent 的完整文本（含契约 + 上下文）。
+
+    contract 由 bot GUI 的「人设与指令 Prompt」页编辑后写进
+    ``config["agent"]["contract"]``；留空则用内置的 CONTRACT。
+    """
     now_time = now_time or time.strftime("%H:%M")
     persona = (persona or "").strip() or "幽默风趣、随和自然的真实好友"
+    rules = (contract or "").strip() or CONTRACT
     return (
-        f"{CONTRACT}\n\n"
+        f"{rules}\n\n"
         f"【当前时间】{now_time}\n"
         f"【联系人】{sender}\n"
         f"【你的人设】{persona}\n"
@@ -265,6 +270,10 @@ class AgentClient(object):
         self.connect_timeout = float(agent_cfg.get("connect_timeout_seconds") or 5)
         self.retries = max(0, int(agent_cfg.get("retries", 1)))
         self.max_defer_seconds = float(agent_cfg.get("max_defer_seconds") or 900)
+        # 可编辑的决策契约（bot GUI → agent.contract；空串 = 用内置 CONTRACT）
+        self.contract = str(agent_cfg.get("contract") or "").strip()
+        # 可编辑的【你的人设】兜底句（空 = 默认；正式人设仍由 DSH 人格卡提供）
+        self.persona_hint = str(agent_cfg.get("persona_hint") or "").strip()
 
         replies = agent_cfg.get("fallback_replies")
         if isinstance(replies, list):
@@ -448,6 +457,12 @@ class AgentClient(object):
         return picked or self.url
 
     # ------------------------------------------------------------------ 主入口
+    def prompt_for(self, sender, message, now_time=None):
+        """用实例上配置的契约/人设拼 prompt（GUI 可编辑，空=内置）。"""
+        return build_prompt(sender, message, now_time=now_time,
+                            contract=self.contract,
+                            persona=self.persona_hint)
+
     def ask(self, context_id, prompt, timeout=None, target=""):
         """问 agent 要一个决策。永远返回合法 dict，绝不抛异常。"""
         if not self.enabled:

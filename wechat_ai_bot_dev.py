@@ -1163,7 +1163,8 @@ def get_agent_client(cfg=None):
     """按配置构建（并缓存）AgentClient 单例。"""
     cfg = cfg if cfg is not None else load_config()
     agent_cfg = cfg.get("agent") or {}
-    key = (agent_cfg.get("url"), bool(agent_cfg.get("enabled", True)), agent_cfg.get("context_prefix"))
+    key = (agent_cfg.get("url"), bool(agent_cfg.get("enabled", True)),
+           agent_cfg.get("context_prefix"), agent_cfg.get("contract") or "")
     if _AGENT_CLIENT[0] is None or _AGENT_CLIENT_KEY[0] != key:
         if AgentClient is None:
             log(f"🚨 [Agent 模块缺失] agent_client.py 导入失败: {_AGENT_IMPORT_ERR}")
@@ -1192,7 +1193,8 @@ def generate_agent_reply(sender, message_content):
             "urgency": "now",
             "reason": "agent_unavailable",
         }
-    prompt = build_prompt(sender, message_content) if build_prompt else message_content
+    prompt = (client.prompt_for(sender, message_content)
+              if hasattr(client, "prompt_for") else build_prompt(sender, message_content))
     # 有微信号就用微信号当会话键：ASCII 稳定，且换备注/换昵称不丢记忆
     return client.ask(client.context_id_for(contact_context_id(sender, cfg)), prompt, target=sender)
 
@@ -1233,7 +1235,8 @@ def submit_agent_job(target, message, signature, cfg=None, source="scan"):
     if client is None:
         return None
 
-    prompt = build_prompt(target, message) if build_prompt else message
+    prompt = (client.prompt_for(target, message)
+              if hasattr(client, "prompt_for") else build_prompt(target, message))
     try:
         _log_route_once(target, client.url_for(target), client)
     except Exception:

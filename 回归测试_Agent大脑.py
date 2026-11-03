@@ -673,6 +673,38 @@ if _dl:
 
 
 # ===========================================================================
+print("=== 15. 可编辑的 A2A 决策契约 ===")
+# ===========================================================================
+_prompt_default = agent_client.build_prompt("老爸", "在吗")
+check_true("默认 prompt 使用内置契约", "只输出一行 JSON" in _prompt_default)
+check_true("默认 prompt 拼上动态上下文", "【联系人】老爸" in _prompt_default and "【对方刚发来】在吗" in _prompt_default)
+
+_prompt_custom = agent_client.build_prompt("老爸", "在吗", contract="自定义契约-ABC")
+check_true("自定义契约替换内置规则",
+           "自定义契约-ABC" in _prompt_custom and "只输出一行 JSON" not in _prompt_custom)
+check_true("自定义契约仍保留动态上下文", "【联系人】老爸" in _prompt_custom and "在吗" in _prompt_custom)
+check_true("空白契约回退内置", "只输出一行 JSON" in agent_client.build_prompt("x", "y", contract="   "))
+
+_cli_custom = agent_client.AgentClient({"agent": {"enabled": False, "contract": "CLI 契约-XYZ"}})
+check_true("AgentClient 记录 contract", _cli_custom.contract == "CLI 契约-XYZ")
+check_true("prompt_for 用实例契约", "CLI 契约-XYZ" in _cli_custom.prompt_for("老爸", "在吗"))
+
+_cli_blank = agent_client.AgentClient({"agent": {"enabled": False}})
+check_true("未配置时 contract 为空串", _cli_blank.contract == "")
+check_true("prompt_for 空契约回退内置", "只输出一行 JSON" in _cli_blank.prompt_for("老爸", "在吗"))
+
+_cli_persona = agent_client.AgentClient({"agent": {"enabled": False, "persona_hint": "嘴硬心软的损友"}})
+check_true("prompt_for 用可编辑人设兜底句",
+           "【你的人设】嘴硬心软的损友" in _cli_persona.prompt_for("老爸", "在吗"))
+check_true("未配置人设时用默认兜底",
+           "幽默风趣、随和自然的真实好友" in _cli_blank.prompt_for("老爸", "在吗"))
+
+# 缓存 key 必须包含 contract，否则界面上改完契约、bot 仍用旧客户端
+_bot_src = open(__file__.replace("回归测试_Agent大脑.py", "wechat_ai_bot_dev.py"), encoding="utf-8").read()
+check_true("get_agent_client 的缓存 key 含 contract",
+           'agent_cfg.get("contract")' in _bot_src)
+
+# ===========================================================================
 print()
 if fails:
     print(f"❌ 回归失败 {len(fails)} 项:")

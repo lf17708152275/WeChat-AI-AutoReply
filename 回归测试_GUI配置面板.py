@@ -216,6 +216,39 @@ finally:
     gui.messagebox.showinfo = _orig_info
     gui.messagebox.showerror = _orig_err
 
+print("\n=== 3b-3. A2A 决策契约编辑器（留空=内置） ===")
+check_true("「人设与指令 Prompt」页有契约编辑框", hasattr(app, "txt_contract"))
+_contract_default = app.txt_contract.get("1.0", tk.END).strip()
+check_true("默认载入内置契约", "只输出一行 JSON" in _contract_default)
+check_true("内置契约含表情规则", "sticker_search" in _contract_default)
+
+_custom_contract = '你是测试用契约，只输出 {"action":"ignore"}'
+app.txt_contract.delete("1.0", tk.END)
+app.txt_contract.insert("1.0", _custom_contract)
+app.save_ui_to_config(show_msg=False)
+_saved_contract = json.load(open(tmp_cfg, encoding="utf-8"))
+check("自定义契约写进 agent.contract",
+      (_saved_contract.get("agent") or {}).get("contract"), _custom_contract)
+
+check_true("人设兜底句输入框存在", hasattr(app, "ent_persona_hint"))
+app.var_persona_hint.set("嘴硬心软的损友")
+app.save_ui_to_config(show_msg=False)
+_saved_persona = json.load(open(tmp_cfg, encoding="utf-8"))
+check("人设兜底句写进 agent.persona_hint",
+      (_saved_persona.get("agent") or {}).get("persona_hint"), "嘴硬心软的损友")
+
+_orig_contract_info = gui.messagebox.showinfo
+gui.messagebox.showinfo = lambda *a, **k: None
+try:
+    app.reset_contract()
+finally:
+    gui.messagebox.showinfo = _orig_contract_info
+check_true("恢复内置后编辑框回到默认", "只输出一行 JSON" in app.txt_contract.get("1.0", tk.END))
+app.save_ui_to_config(show_msg=False)
+_saved_contract2 = json.load(open(tmp_cfg, encoding="utf-8"))
+check("内置契约=默认时存空串（跟随内置）",
+      (_saved_contract2.get("agent") or {}).get("contract"), "")
+
 print("\n=== 3c. 底部实时日志监听 ===")
 check_true("日志面板在主区域分栏内（拖不出来也挤不掉）",
            len(app.main_pane.panes()) == 2 and int(app.txt_log.winfo_height()) > 60)
