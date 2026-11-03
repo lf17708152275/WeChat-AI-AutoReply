@@ -321,6 +321,10 @@ class _FakeProc:
     pid = 424242
 _orig_popen = _sub.Popen
 _sub.Popen = lambda *a, **k: (_spawned.append(a), _FakeProc())[1]
+# 关键隔离：直接把 systemd 动作换成打桩函数，绝不动真实的 wechat-bot.service
+_orig_systemd = gui._systemd_bot_action
+gui._systemd_bot_action = lambda action: _spawned.append(
+    ("systemctl", "--user", "restart" if action == "start" else "stop", "wechat-bot"))
 gui.messagebox.showinfo = lambda *a, **k: None
 gui.messagebox.showerror = lambda *a, **k: None
 gui.messagebox.showwarning = lambda *a, **k: None
@@ -357,6 +361,7 @@ check_true("停止走 systemd stop",
            bool(_spawned) and "stop" in str(_spawned[-1]) and "systemctl" in str(_spawned[-1]))
 
 _sub.Popen = _orig_popen
+gui._systemd_bot_action = _orig_systemd
 gui.WeChatBotGUI.kill_bot_processes = _orig_kill
 app3.destroy()
 

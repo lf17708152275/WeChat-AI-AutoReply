@@ -41,6 +41,15 @@ CONFIG_FILE = os.path.join(WORKSPACE_DIR, "wechat_config_dev.json")
 LOG_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.log")
 # 守护进程若由 systemd user unit 托管（推荐），启停必须走 systemctl，避免再拉起第二份进程
 SYSTEMD_BOT_UNIT_FILE = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", "wechat-bot.service")
+
+
+def _systemd_bot_action(action):
+    """通过 systemd 控制 wechat-bot.service（独立成函数，方便回归测试打桩，绝不误停真实服务）。"""
+    import subprocess as _sp
+    verb = "restart" if action == "start" else "stop"
+    _sp.Popen(["systemctl", "--user", verb, "wechat-bot"],
+              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+
 PID_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.pid")
 BOT_SCRIPT = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.py")
 
@@ -1749,15 +1758,11 @@ class WeChatBotGUI(tk.Tk):
         def _work():
             use_systemd = IS_LINUX and os.path.exists(SYSTEMD_BOT_UNIT_FILE)
             if use_systemd:
-                import subprocess as _sp
                 try:
+                    _systemd_bot_action(action)
                     if action != "start":
-                        _sp.Popen(["systemctl", "--user", "stop", "wechat-bot"],
-                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                         self._bot_action_result = (True, "已停止", "⏹️ 已停止 systemd 守护进程（wechat-bot.service）。")
                     else:
-                        _sp.Popen(["systemctl", "--user", "restart", "wechat-bot"],
-                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                         self._bot_action_result = (True, "启动成功", "🚀 已通过 systemd 重启守护进程（wechat-bot.service）！")
                 except Exception as e:
                     self._bot_action_result = (False, "操作失败", f"systemctl 调用失败: {e}")
