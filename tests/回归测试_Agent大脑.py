@@ -14,8 +14,8 @@ import types
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE)
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 # ---------------------------------------------------------------------------
 # 给缺失的重型依赖打桩（本机可能没装 numpy / pyperclip / rapidocr）
@@ -736,7 +736,7 @@ check_true("未配置人设时用默认兜底",
            "幽默风趣、随和自然的真实好友" in _cli_blank.prompt_for("老爸", "在吗"))
 
 # 缓存 key 必须包含 contract，否则界面上改完契约、bot 仍用旧客户端
-_bot_src = open(__file__.replace("回归测试_Agent大脑.py", "wechat_ai_bot_dev.py"), encoding="utf-8").read()
+_bot_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "wechat_ai_bot_dev.py"), encoding="utf-8").read()
 check_true("get_agent_client 的缓存 key 含 contract",
            'agent_cfg.get("contract")' in _bot_src)
 

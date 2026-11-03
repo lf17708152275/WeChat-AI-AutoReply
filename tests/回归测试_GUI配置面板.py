@@ -13,7 +13,7 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 PASS = 0
 FAIL = 0
@@ -40,7 +40,7 @@ import wechat_bot_gui_dev as gui
 # ---- 用临时配置，避免污染真实配置 ----
 tmpdir = tempfile.mkdtemp(prefix="wxgui_")
 tmp_cfg = os.path.join(tmpdir, "cfg.json")
-src_cfg = os.path.join(gui.WORKSPACE_DIR, "wechat_config_dev.json")
+src_cfg = gui.CONFIG_FILE
 if os.path.exists(src_cfg):
     shutil.copy(src_cfg, tmp_cfg)
 else:

@@ -37,7 +37,7 @@ for _name in ("numpy", "pyperclip", "rapidocr_onnxruntime"):
                 _stub.RapidOCR = lambda *a, **k: (lambda img: ([], None))
             sys.modules[_name] = _stub
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import wechat_ai_bot_dev as bot
 
 PASS = 0

@@ -33,13 +33,23 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
+# 代码在 src/ 下，运行期数据在仓库根的 data/ 与 logs/（见 README「目录结构」）
 if getattr(sys, 'frozen', False):
     WORKSPACE_DIR = os.path.dirname(sys.executable)
 else:
-    WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+    WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(WORKSPACE_DIR, "assets")
+DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
+LOG_DIR = os.path.join(WORKSPACE_DIR, "logs")
+for _d in (DATA_DIR, LOG_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except Exception:
+        pass
 
-CONFIG_FILE = os.path.join(WORKSPACE_DIR, "wechat_config_dev.json")
-LOG_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.log")
+CONFIG_FILE = os.path.join(DATA_DIR, "wechat_config_dev.json")
+LOG_FILE = os.path.join(LOG_DIR, "wechat_bot_dev.log")
 # 守护进程若由 systemd user unit 托管（推荐），启停必须走 systemctl，避免再拉起第二份进程
 SYSTEMD_BOT_UNIT_FILE = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", "wechat-bot.service")
 
@@ -51,8 +61,8 @@ def _systemd_bot_action(action):
     _sp.Popen(["systemctl", "--user", verb, "wechat-bot"],
               stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
 
-PID_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.pid")
-BOT_SCRIPT = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.py")
+PID_FILE = os.path.join(DATA_DIR, "wechat_bot_dev.pid")
+BOT_SCRIPT = os.path.join(SRC_DIR, "wechat_ai_bot_dev.py")
 
 _K32 = None
 
@@ -134,8 +144,8 @@ def fast_process_names():
         finally:
             k32.CloseHandle(h)
     return names
-KILL_SCRIPT = os.path.join(WORKSPACE_DIR, "kill_wechat_bot_dev.py")
-PENDING_FILE = os.path.join(WORKSPACE_DIR, "pending_confirm.jsonl")
+KILL_SCRIPT = os.path.join(SRC_DIR, "kill_wechat_bot_dev.py")
+PENDING_FILE = os.path.join(DATA_DIR, "pending_confirm.jsonl")
 
 if IS_WIN:
     user32 = ctypes.windll.user32
@@ -262,7 +272,7 @@ class WeChatBotGUI(tk.Tk):
         self.geometry("1320x920")
         self.minsize(1180, 800)
         
-        ico_file = os.path.join(WORKSPACE_DIR, "wechat_sky_blue_unread_ai_v4.ico")
+        ico_file = os.path.join(ASSETS_DIR, "wechat_sky_blue_unread_ai_v4.ico")
         if os.path.exists(ico_file):
             try:
                 self.iconbitmap(ico_file)
@@ -477,6 +487,11 @@ class WeChatBotGUI(tk.Tk):
 
         self.lbl_bot_status = ttk.Label(status_left, text="⚪ AI 守护进程: 正在检测...", font=("微软雅黑", 9, "bold"))
         self.lbl_bot_status.pack(side=tk.LEFT, padx=10)
+
+        # 桌面合成器（root 截图的前提：合成器开着时 bot 抓不到微信，见 README）
+        self.lbl_desktop_status = ttk.Label(status_left, text="⚪ 桌面合成器: 检测中...",
+                                            font=("微软雅黑", 9, "bold"))
+        self.lbl_desktop_status.pack(side=tk.LEFT, padx=10)
 
         # Action Buttons
         btn_box = ttk.Frame(top_frame)
@@ -710,8 +725,8 @@ class WeChatBotGUI(tk.Tk):
     def _builtin_contract_text(self):
         """内置契约（agent_client.CONTRACT）；导入失败时退回空串。"""
         try:
-            if WORKSPACE_DIR not in sys.path:
-                sys.path.insert(0, WORKSPACE_DIR)
+            if SRC_DIR not in sys.path:
+                sys.path.insert(0, SRC_DIR)
             import agent_client
             return str(getattr(agent_client, "CONTRACT", "") or "").strip()
         except Exception:
@@ -1696,8 +1711,8 @@ class WeChatBotGUI(tk.Tk):
 
         def _work():
             try:
-                if WORKSPACE_DIR not in sys.path:
-                    sys.path.insert(0, WORKSPACE_DIR)
+                if SRC_DIR not in sys.path:
+                    sys.path.insert(0, SRC_DIR)
                 from agent_client import AgentClient
                 cli = AgentClient(cfg)
                 ok = cli.is_available(timeout=3.0)
@@ -2420,14 +2435,14 @@ class WeChatBotGUI(tk.Tk):
             if not os.path.exists(exe_path):
                 exe_path = os.path.join(WORKSPACE_DIR, "微信AI控制中心.exe")
             
-            gui_script = os.path.join(WORKSPACE_DIR, "wechat_bot_gui_dev.py")
-            ico_path = os.path.join(WORKSPACE_DIR, "wechat_sky_blue_unread_ai_v4.ico")
+            gui_script = os.path.join(SRC_DIR, "wechat_bot_gui_dev.py")
+            ico_path = os.path.join(ASSETS_DIR, "wechat_sky_blue_unread_ai_v4.ico")
             if not os.path.exists(ico_path):
-                ico_path = os.path.join(WORKSPACE_DIR, "wechat_sky_blue_v2.ico")
+                ico_path = os.path.join(ASSETS_DIR, "wechat_sky_blue_v2.ico")
             if not os.path.exists(ico_path):
-                ico_path = os.path.join(WORKSPACE_DIR, "wechat_sky_blue_ai_v3.ico")
+                ico_path = os.path.join(ASSETS_DIR, "wechat_sky_blue_ai_v3.ico")
             if not os.path.exists(ico_path):
-                ico_path = os.path.join(WORKSPACE_DIR, "wechat_blue.ico")
+                ico_path = os.path.join(ASSETS_DIR, "wechat_blue.ico")
 
             if os.path.exists(exe_path):
                 target = exe_path
@@ -2492,6 +2507,32 @@ class WeChatBotGUI(tk.Tk):
                     bot_text = "⚪ AI 守护进程: 检测中..."
                     bot_color = "#666666"
 
+                # 2.5 桌面合成器自检：开着的话 root 截图会失效（能自动关就关）
+                comp_text, comp_color = None, None
+                try:
+                    now_ts = time.time()
+                    if now_ts - getattr(self, "_compositing_check_at", 0.0) > 5.0:
+                        self._compositing_check_at = now_ts
+                        if lx is not None and lx.compositing_enabled():
+                            _msgs = []
+                            ok = lx.ensure_no_compositing(log=lambda m: _msgs.append(m))
+                            for _m in _msgs:
+                                self._ui_call(lambda __m=_m: self.append_log(__m))
+                            if ok:
+                                comp_text = "🟢 桌面合成器: 已关闭（自动修复）"
+                                comp_color = "#107c41"
+                            else:
+                                comp_text = "🔴 桌面合成器: 开启中（截图会失效！）"
+                                comp_color = "#d83b01"
+                        else:
+                            comp_text = "🟢 桌面合成器: 未开启（截图正常）"
+                            comp_color = "#107c41"
+                        self._compositing_cache = (comp_text, comp_color)
+                    else:
+                        comp_text, comp_color = getattr(self, "_compositing_cache", (None, None))
+                except Exception:
+                    pass
+
                 # 3. Read incremental logs
                 new_logs = ""
                 if os.path.exists(LOG_FILE):
@@ -2515,7 +2556,7 @@ class WeChatBotGUI(tk.Tk):
                 if not self.is_monitoring:
                     break
                 try:
-                    self._ui_call(lambda wt=wx_text, wc=wx_color, bt=bot_text, bc=bot_color, nl=new_logs: self._update_ui_state(wt, wc, bt, bc, nl))
+                    self._ui_call(lambda wt=wx_text, wc=wx_color, bt=bot_text, bc=bot_color, nl=new_logs, ct=comp_text, cc=comp_color: self._update_ui_state(wt, wc, bt, bc, nl, ct, cc))
                 except Exception:
                     pass
                 time.sleep(1.0)
@@ -2523,9 +2564,12 @@ class WeChatBotGUI(tk.Tk):
         t = threading.Thread(target=monitor_loop, daemon=True)
         t.start()
 
-    def _update_ui_state(self, wx_text, wx_color, bot_text, bot_color, new_logs):
+    def _update_ui_state(self, wx_text, wx_color, bot_text, bot_color, new_logs,
+                         comp_text=None, comp_color=None):
         self.lbl_wx_status.configure(text=wx_text, foreground=wx_color)
         self.lbl_bot_status.configure(text=bot_text, foreground=bot_color)
+        if comp_text:
+            self.lbl_desktop_status.configure(text=comp_text, foreground=comp_color or "#333333")
         if not getattr(self, "_bot_action_running", False):
             self._refresh_toggle_button()
         if new_logs:

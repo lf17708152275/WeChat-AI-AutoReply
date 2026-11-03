@@ -17,7 +17,7 @@ import time
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 # GUI 模块 import 时会 ctypes.windll，Windows 上没问题
 import wechat_bot_gui_dev as gui

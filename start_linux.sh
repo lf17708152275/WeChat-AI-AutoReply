@@ -45,9 +45,9 @@ echo "▶ DISPLAY=$DISPLAY" >&2
 mode="${1:-bot}"
 case "$mode" in
   gui)
-    exec python3 wechat_bot_gui_dev.py
+    exec python3 src/wechat_bot_gui_dev.py
     ;;
   bot|*)
-    exec python3 wechat_ai_bot_dev.py
+    exec python3 src/wechat_ai_bot_dev.py
     ;;
 esac

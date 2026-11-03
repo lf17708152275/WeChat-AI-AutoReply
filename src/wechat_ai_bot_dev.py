@@ -83,15 +83,23 @@ ensure_default_desktop()
 # =============================================================================
 # 1. CONSTANTS & SYSTEM PATHS
 # =============================================================================
+# 代码在 src/ 下，运行期数据在仓库根的 data/ 与 logs/（见 README「目录结构」）
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+for _d in (DATA_DIR, LOG_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except Exception:
+        pass
 
-CONFIG_FILE = os.path.join(BASE_DIR, "wechat_config_dev.json")
-CONVO_MAP_FILE = os.path.join(BASE_DIR, "wechat_convo_map.json")
-PID_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.pid")
-LOG_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.log")
+CONFIG_FILE = os.path.join(DATA_DIR, "wechat_config_dev.json")
+CONVO_MAP_FILE = os.path.join(DATA_DIR, "wechat_convo_map.json")
+PID_FILE = os.path.join(DATA_DIR, "wechat_bot_dev.pid")
+LOG_FILE = os.path.join(LOG_DIR, "wechat_bot_dev.log")
 
 try:
     if sys.stdout:
@@ -3384,7 +3392,7 @@ def scan_and_reply_wechat(hwnd):
 #     机器人就主动找这个好友、把话发出去 —— 不依赖对方先发消息。
 #     护栏是硬性的：白名单、频率、确认开关，任一不过就拒绝，绝不硬发。
 # =============================================================================
-PENDING_CONFIRM_FILE = os.path.join(BASE_DIR, "pending_confirm.jsonl")
+PENDING_CONFIRM_FILE = os.path.join(DATA_DIR, "pending_confirm.jsonl")
 
 # 系统号：主动发送永远不碰
 SYSTEM_ACCOUNTS = {
@@ -3742,6 +3750,7 @@ def _proactive_http_handler():
                     "max_per_day": ps.get("max_per_day"),
                     "pending_confirm": len(list_pending()),
                     "wechat_running": WECHAT_HWND_CACHE[0] is not None,
+                    "compositing": bool(lx and lx.compositing_enabled()),
                 })
             if path == "/pending":
                 return self._json(200, {"ok": True, "items": list_pending()})
@@ -3889,9 +3898,28 @@ def main_loop():
         _load_pending_confirm()
         start_proactive_server(cfg_boot)
     log("=" * 60)
-    
+    # 环境自检：桌面合成器会让 root 截图为陈旧画面，能自动关就关掉（用户 m11297 要求加校验）
+    try:
+        lx.ensure_no_compositing(log=log)
+    except Exception as _e:
+        log(f"⚠️ [环境] 合成器自检失败: {_e}")
+
+    _compositor_next_check = 0.0
     while True:
         try:
+            # 运行期每 20 秒复查一次：合成器可能被用户/设置中途打开
+            _now = time.time()
+            if _now >= _compositor_next_check:
+                _compositor_next_check = _now + 20.0
+                try:
+                    if lx.compositing_enabled():
+                        if not lx.ensure_no_compositing(log=log):
+                            # 关不掉：每 2 分钟提醒一次，别刷屏
+                            log("⚠️ [环境] 桌面合成器仍在开启：微信截图会是旧画面，请手动关闭（见上面命令）")
+                            _compositor_next_check = _now + 120.0
+                except Exception:
+                    pass
+            hwnd, ver = get_wechat_hwnd()
             hwnd, ver = get_wechat_hwnd()
             WECHAT_HWND_CACHE[0] = hwnd
             if hwnd:

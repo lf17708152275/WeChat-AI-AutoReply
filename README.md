@@ -75,19 +75,20 @@ pip install -r requirements.txt
 ```
 
 #### 3. 配置文件准备
-复制配置模板文件：
+复制配置模板到运行数据目录（`data/` 不入库，避免泄露密钥）：
 ```bash
-copy wechat_config.example.json wechat_config_dev.json
+mkdir -p data
+cp wechat_config.example.json data/wechat_config_dev.json     # Windows: copy ... data\...
 ```
-在 `wechat_config_dev.json` 中配置您的 `api_key`、`api_base` 以及好友白名单 `whitelist`。
+在 `data/wechat_config_dev.json` 中配置您的 `api_key`、`api_base` 以及好友白名单 `whitelist`。
 
-#### 4. 运行可视化控制中心
+#### 4. 运行
 ```bash
-python wechat_bot_gui_dev.py
-```
-或直接无界面静默守护运行核心：
-```bash
-python wechat_ai_bot_dev.py
+./start_linux.sh          # Linux：后台常量守护（推荐 systemd user unit，见下文）
+./start_linux.sh gui      # Linux：可视化控制中心
+# 或者直接：
+python3 src/wechat_bot_gui_dev.py
+python3 src/wechat_ai_bot_dev.py
 ```
 
 ---
@@ -311,36 +312,58 @@ curl -X POST "http://127.0.0.1:8765/send?target=张三&text=在忙吗？"
 
 ```text
 WeChat-AI-AutoReply/
-├── wechat_ai_bot_dev.py          # 后台常驻感知与调度核心 (OCR+Win32消息路由+离屏抓图)
-├── wechat_bot_gui_dev.py         # 现代化控制中心 GUI (Tkinter + 实时日志 + 待确认弹窗)
-├── agent_client.py               # Agent 大脑客户端 (A2A 协议 + JSON 契约 + 降级兜底)
-├── kill_wechat_bot_dev.py        # 安全进程清理终结脚本 (精准定向关闭守护)
-├── Linux移植规划.md              # Linux 平台移植调研与实施方案（已调研，未开工）
-├── 下一步详细方案.md              # P1 群聊 / P2 群聊回复 / P3 人格关系 / P5 收尾 的详细设计
-├── wechat_config.example.json    # 工业级通用脱敏配置文件模板
-├── .env.example                  # 环境变量配置模板
-├── requirements.txt              # Python 依赖清单
-├── .gitignore                    # 工业级排除规则 (严防私密配置与日志外泄)
-├── LICENSE                       # MIT 开源许可证
-└── README.md                     # 项目说明文档
+├── start_linux.sh                # 唯一入口：./start_linux.sh [bot|gui]
+├── src/                          # 所有 Python 源码
+│   ├── wechat_ai_bot_dev.py      # 后台常驻感知与调度核心 (OCR + 消息路由 + 离屏抓图)
+│   ├── wechat_bot_gui_dev.py     # 控制中心 GUI (Tkinter + 实时日志 + 待确认弹窗)
+│   ├── wechat_linux_io.py        # Linux/X11 I/O：抓图、点击、剪贴板、离屏守护、合成器校验
+│   ├── x11_offscreen.py          # 离屏隐藏的常驻 X 助手（redirect/unredirect 唯一客户端）
+│   ├── agent_client.py           # Agent 大脑客户端 (A2A 协议 + JSON 契约 + 降级兜底)
+│   ├── persona_cards.py          # 人格卡工具（解析/导入/生成，DSH 人格卡源）
+│   └── kill_wechat_bot_dev.py    # 安全进程清理终结脚本
+├── tests/                        # 七套回归 + 真实 Agent 联调脚本
+│   ├── 回归测试_Agent大脑.py
+│   ├── 回归测试_通讯录映射.py
+│   ├── 回归测试_待确认队列.py
+│   ├── 回归测试_主动发送.py
+│   ├── 回归测试_防串发匹配.py
+│   ├── 回归测试_GUI配置面板.py
+│   ├── 回归测试_待确认GUI.py
+│   └── 联调脚本_真实Agent.py
+├── docs/                         # 设计/验证文档（Linux 移植、流程图、A2A 记录等）
+├── assets/                       # 窗口/托盘图标
+├── data/                         # 运行期配置与状态（gitignore：config/contexts/pid/pending）
+├── logs/                         # 运行日志（gitignore）
+├── dev/                          # 本机开发探针脚本与临时产物（gitignore）
+├── requirements.txt / requirements_linux.txt
+├── wechat_config.example.json    # 脱敏配置模板
+├── .env.example
+├── .gitignore
+├── LICENSE
+└── README.md
 ```
+
+> 老的根目录布局（代码/配置/日志/探针脚本混在一起）已弃用。脚本一律从仓库根运行，
+> 源码在 `src/`、运行期数据在 `data/`、日志在 `logs/`。
 
 ### 🧪 回归测试
 
+在仓库根运行（脚本自己会把 `src/` 加进 `sys.path`）：
+
 ```bash
-python 回归测试_防串发匹配.py    # 防串发 / 名字匹配 / 气泡解析
-python 回归测试_通讯录映射.py    # contacts 解析、备注↔微信号、白名单并集、/contacts 接口
-python 回归测试_Agent大脑.py     # Agent 客户端、契约解析、降级、并发总线
-python 回归测试_主动发送.py      # 主动发送护栏、HTTP 接口、找人三级策略
-python 回归测试_待确认队列.py    # 待确认队列落盘/恢复/确认/拒绝/过期
-python 回归测试_待确认GUI.py     # GUI 侧队列读写与接口对齐
-python 回归测试_GUI配置面板.py   # GUI 配置面板控件与保存逻辑
+python3 tests/回归测试_防串发匹配.py    # 防串发 / 名字匹配 / 气泡解析
+python3 tests/回归测试_通讯录映射.py    # contacts 解析、备注↔微信号、白名单并集、/contacts 接口
+python3 tests/回归测试_Agent大脑.py     # Agent 客户端、契约解析、降级、并发总线
+python3 tests/回归测试_主动发送.py      # 主动发送护栏、HTTP 接口、找人三级策略
+python3 tests/回归测试_待确认队列.py    # 待确认队列落盘/恢复/确认/拒绝/过期
+python3 tests/回归测试_待确认GUI.py     # GUI 侧队列读写与接口对齐
+python3 tests/回归测试_GUI配置面板.py   # GUI 配置面板控件与保存逻辑
 ```
 
 联调（需要 DSH 的 A2A 服务在跑）：
 
 ```bash
-python 联调脚本_真实Agent.py     # 提交 -> 后台决策 -> 取回 -> 发送/不发 全链路
+python3 tests/联调脚本_真实Agent.py     # 提交 -> 后台决策 -> 取回 -> 发送/不发 全链路
 ```
 
 ---
@@ -399,7 +422,27 @@ bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）。�
 > 一旦 Enter 已发出就**绝不重发**（避免给同一个人发两遍）。
 
 Linux 依赖安装（无 pip 环境的手动装法）、`DISPLAY` / `XAUTHORITY` 设置、七套回归测试的跑法，
-见 **[Linux移植规划.md](Linux移植规划.md)** 与本文档「🧪 回归测试」一节。
+见 **[docs/Linux移植规划.md](docs/Linux移植规划.md)** 与本文档「🧪 回归测试」一节。
+
+### 🖥️ 桌面合成器校验（Linux）
+
+root 截图（`XGetImage(root)`）拿到的永远是「未合成」画面。桌面一旦开着**合成器**
+（xfwm4 的 compositing、picom、compiz 等），窗口都画进合成器自己的离屏 buffer，
+root 截图就只剩桌面背景/旧像素 —— bot 会**抓不到微信、看起来像瞎了**。
+
+bot 和 GUI 都会在启动时 + 运行中每 5–20 秒自检：
+
+- 检测：xfwm4 环境读 `xfconf-query -c xfwm4 -p /general/use_compositing`；其他合成器看 `_NET_WM_CM_S0` 是否有属主；
+- 修复：xfwm4 合成器会被**自动关闭**（`use_compositing=false`），并在日志里写一行 `🖼️ [环境] 已自动关闭 xfwm4 合成器`；
+- 关不掉时：日志持续告警、GUI 状态栏显示 `🔴 桌面合成器: 开启中（截图会失效！）`，
+  `GET /status` 也会带 `"compositing": true`，方便外部监控。
+
+手动检查/关闭：
+
+```bash
+xfconf-query -c xfwm4 -p /general/use_compositing          # true 就是开着
+xfconf-query -c xfwm4 -p /general/use_compositing -s false # 关掉（立即生效）
+```
 
 ---
 

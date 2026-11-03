@@ -13,8 +13,8 @@ import time
 import types
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-BASE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE)
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 
 def _stub(name, **attrs):

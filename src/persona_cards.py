@@ -28,8 +28,13 @@ import re
 import struct
 import time
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CARD_DIR = os.path.join(BASE_DIR, "persona_cards")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CARD_DIR = os.path.join(BASE_DIR, "data", "persona_cards")
+if not os.path.isdir(CARD_DIR):
+    # 兼容旧的仓库根 persona_cards/ 布局
+    _legacy = os.path.join(BASE_DIR, "persona_cards")
+    if os.path.isdir(_legacy):
+        CARD_DIR = _legacy
 BUILTIN_DIR = os.path.join(CARD_DIR, "builtin")
 
 # 世界书默认最多注入几条（多了会把短句回复挤成说明书）

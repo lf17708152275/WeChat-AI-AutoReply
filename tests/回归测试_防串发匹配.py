@@ -13,9 +13,10 @@ import io
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-BOT = os.path.join(BASE, "wechat_ai_bot_dev.py")
-GUI = os.path.join(BASE, "wechat_bot_gui_dev.py")
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC = os.path.join(BASE, "src")
+BOT = os.path.join(SRC, "wechat_ai_bot_dev.py")
+GUI = os.path.join(SRC, "wechat_bot_gui_dev.py")
 
 def extract(path, names, ns):
     src = open(path, encoding='utf-8').read()
@@ -30,7 +31,7 @@ def extract(path, names, ns):
     return ns
 
 # 人格卡模块提供 normalize_title（剥未读数尾缀），匹配逻辑依赖它，得一起注入
-sys.path.insert(0, BASE)
+sys.path.insert(0, SRC)
 try:
     import persona_cards as _pcards
 except Exception:

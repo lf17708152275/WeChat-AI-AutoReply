@@ -318,7 +318,14 @@ class AgentClient(object):
 
         self.logger = None          # 由主程序注入 log()，默认 print
         self.last_error = None
-        self._mapping_path = agent_cfg.get("context_map_file")
+        _mp = agent_cfg.get("context_map_file")
+        if _mp:
+            _mp = str(_mp)
+            if not os.path.isabs(_mp):
+                # 相对路径统一以仓库根为基准；只写文件名的旧配置落到 data/ 下
+                _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                _mp = os.path.join(_root, "data", _mp) if os.path.basename(_mp) == _mp else os.path.join(_root, _mp)
+        self._mapping_path = _mp
         # contextId 轮换表（会话冲突自愈用），默认跟映射表放同一个目录
         rot_file = str(agent_cfg.get("context_rot_file") or "").strip()
         if not rot_file:
@@ -836,8 +843,10 @@ def _selftest():
     cfg = {}
     cfg_path = None
     import os
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("wechat_config_dev.json", "wechat_config.json"):
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in (os.path.join("data", "wechat_config_dev.json"),
+                 os.path.join("data", "wechat_config.json"),
+                 "wechat_config_dev.json", "wechat_config.json"):
         p = os.path.join(here, name)
         if os.path.exists(p):
             cfg_path = p

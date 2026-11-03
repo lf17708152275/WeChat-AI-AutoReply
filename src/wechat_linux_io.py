@@ -25,6 +25,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -1038,6 +1039,99 @@ def clipboard_copy_image(path):
         return True
     except Exception:
         return False
+
+
+# ----------------------------------------------------------------------------
+# 桌面合成器检测（Composite Manager）
+# ----------------------------------------------------------------------------
+# 背景：root 截图（XGetImage(root)）拿到的永远是「未合成」的画面。桌面一旦开着合成器
+# （xfwm4 的 use_compositing、picom、compiz 等），窗口都只画进合成器自己的离屏 buffer，
+# root 截图就只剩桌面背景/陈旧像素 —— bot 会抓不到微信，看起来像“瞎了”。
+# 这里在启动时和运行期都检查一次：能自动关就关掉（xfwm4 可以），关不掉就持续告警。
+_CM_SELECTION = "_NET_WM_CM_S0"
+
+
+def _cm_owner_wid():
+    """返回持有 _NET_WM_CM_S0 的合成器窗口 id；没有合成器返回 0。"""
+    try:
+        d = display.Display()
+        try:
+            owner = d.get_selection_owner(d.intern_atom(_CM_SELECTION))
+            return int(owner.id) if owner else 0
+        finally:
+            try:
+                d.close()
+            except Exception:
+                pass
+    except Exception:
+        return 0
+
+
+def xfwm4_compositing_setting():
+    """读 xfconf 的 xfwm4/general/use_compositing；读不到返回 None。"""
+    if not shutil.which("xfconf-query"):
+        return None
+    try:
+        out = subprocess.run(
+            ["xfconf-query", "-c", "xfwm4", "-p", "/general/use_compositing"],
+            capture_output=True, text=True, timeout=3)
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip().lower() == "true"
+    except Exception:
+        return None
+
+
+def compositing_enabled():
+    """桌面是否真的开着合成器（是则 root 截图不可信）。
+
+    判定顺序：
+    1) xfwm4 环境以 xfconf 的 use_compositing 为准 —— 实测 xfwm4 就算合成关着，
+       也一直持有 _NET_WM_CM_S0 这个 selection，用 selection 判会误报；
+    2) 其他合成器（picom 等）没有 xfconf 设置，只能看 _NET_WM_CM_S0 有没有属主。
+    """
+    setting = xfwm4_compositing_setting()
+    if setting is not None:
+        return setting
+    return _cm_owner_wid() != 0
+
+
+def set_compositing(enabled, timeout=5.0):
+    """尝试开/关 xfwm4 合成器，等到 xfconf 状态真的翻转；成功返回 True。"""
+    if not shutil.which("xfconf-query"):
+        return False
+    try:
+        subprocess.run(
+            ["xfconf-query", "-c", "xfwm4", "-p", "/general/use_compositing",
+             "-s", "true" if enabled else "false"],
+            capture_output=True, text=True, timeout=3)
+    except Exception:
+        return False
+    deadline = time.time() + max(1.0, timeout)
+    while time.time() < deadline:
+        time.sleep(0.15)
+        if xfwm4_compositing_setting() == bool(enabled):
+            return True
+    return False
+
+
+def ensure_no_compositing(log=None, auto_fix=True):
+    """确保桌面没有合成器。返回 True=没问题/已自动关掉；False=检测到但关不掉。"""
+    if not compositing_enabled():
+        return True
+    say = log or (lambda _m: None)
+    owner = _cm_owner_wid()
+    how = "xfwm4 use_compositing=true" if xfwm4_compositing_setting() is not None else f"_NET_WM_CM_S0 属主 {hex(owner)}"
+    say(f"🖼️ [环境] 检测到桌面合成器已开启（{how}）：root 截图会拿到陈旧画面，bot 会看不到微信")
+    if auto_fix and xfwm4_compositing_setting() is not None:
+        if set_compositing(False):
+            say("🖼️ [环境] 已自动关闭 xfwm4 合成器（xfconf /general/use_compositing=false）")
+            return True
+        say("⚠️ [环境] 自动关闭 xfwm4 合成器失败，请手动执行："
+            "xfconf-query -c xfwm4 -p /general/use_compositing -s false")
+        return False
+    say("⚠️ [环境] 这个合成器 bot 关不掉：请手动关闭桌面合成器，否则微信截图会一直是旧画面")
+    return False
 
 
 def clipboard_paste():
