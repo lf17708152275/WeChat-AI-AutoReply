@@ -165,15 +165,18 @@ pc.logger = lambda m: None
 
 check("标准 JSON",
       pc._parse('{"action":"reply","text":"在的","urgency":"now","reason":"r"}'),
-      {"action": "reply", "text": "在的", "segments": ["在的"], "stickers": [], "urgency": "now", "reason": "r"})
+      {"action": "reply", "text": "在的", "segments": ["在的"], "stickers": [],
+       "meme_captions": [], "meme_paths": [], "urgency": "now", "reason": "r"})
 
 check("markdown 围栏包裹",
       pc._parse('```json\n{"action":"ignore","text":"","urgency":"now","reason":"广告"}\n```'),
-      {"action": "ignore", "text": "", "segments": [], "stickers": [], "urgency": "now", "reason": "广告"})
+      {"action": "ignore", "text": "", "segments": [], "stickers": [],
+       "meme_captions": [], "meme_paths": [], "urgency": "now", "reason": "广告"})
 
 check("前后夹带废话",
       pc._parse('好的，我判断如下：\n{"action":"reply","text":"来了","urgency":"soon","reason":"x"}\n以上。'),
-      {"action": "reply", "text": "来了", "segments": ["来了"], "stickers": [], "urgency": "soon", "reason": "x"})
+      {"action": "reply", "text": "来了", "segments": ["来了"], "stickers": [],
+       "meme_captions": [], "meme_paths": [], "urgency": "soon", "reason": "x"})
 
 check("缺 action 但有正文 → reply",
       pc._parse('{"text":"哈哈哈","urgency":"now"}')["action"], "reply")
@@ -628,7 +631,7 @@ check("失败任务的 status.message 会带进异常",
 
 # ===========================================================================
 print("=== 5.5 表情回复解析（DSH 表情插件）===")
-_sticker_url = "http://127.0.0.1:25675/x-nekowhale-stickers/s/4b1576f9a927.gif"
+_sticker_url = "http://127.0.0.1:25675/dsh-memes/dafeiyu-001/memes/happy/deyi.jpg"
 _plain = agent_client.AgentClient.__new__(agent_client.AgentClient)
 
 # 1) 模型按契约把表情放进 sticker 字段
@@ -670,6 +673,36 @@ _dl = _wb.download_sticker(_sticker_url)
 if _dl:
     import os as _os
     _os.remove(_dl)
+
+
+# ===========================================================================
+print("=== 5.6 dsh-meme 表情（[表情: 描述] / /dsh-memes/ 路径）===")
+# 插件已从 nekowhale 换成 dsh-meme：模型会把「[表情: 描述]」或 /dsh-memes/... 写进回复
+_meme_caption = "得意闭眼拳头，好耶，小鲸鱼娘很满意"
+_clean, _caps, _paths = agent_client.split_meme_refs("好耶[表情: %s]" % _meme_caption)
+check("文字里的[表情:]被剥掉", _clean, "好耶")
+check("描述被收集", _caps, [_meme_caption])
+_clean2, _caps2, _paths2 = agent_client.split_meme_refs("看图 /dsh-memes/dafeiyu-001/memes/happy/deyi.jpg 这个")
+check("正文里的 /dsh-memes/ 路径被剥掉", _paths2,
+      ["/dsh-memes/dafeiyu-001/memes/happy/deyi.jpg"])
+check("路径剥离后正文不留 URL", "/dsh-memes/" not in _clean2, True)
+
+_dm = _plain._parse('{"action":"reply","segments":["好耶[表情: %s]"],"urgency":"now"}' % _meme_caption)
+check("JSON 里的[表情:]进 meme_captions", _dm.get("meme_captions"), [_meme_caption])
+check("[表情:]不会留在正文", _dm.get("segments"), ["好耶"])
+_dm2 = _plain._parse('{"action":"reply","segments":["你看"],"sticker":"/dsh-memes/dafeiyu-001/memes/happy/deyi.jpg"}')
+check("sticker 字段里的表情路径进 meme_paths", _dm2.get("meme_paths"),
+      ["/dsh-memes/dafeiyu-001/memes/happy/deyi.jpg"])
+
+_url_by_caption = _wb._resolve_meme_caption(_meme_caption)
+check_true("描述能在 dsh-meme 图库里查到图", bool(_url_by_caption) and "/dsh-memes/" in _url_by_caption)
+_sticker_urls = _wb._decision_stickers({"meme_captions": [_meme_caption], "meme_paths": []})
+check_true("描述会换成可下载的绝对 URL", bool(_sticker_urls) and _sticker_urls[0].startswith("http://"))
+_meme_file = _wb.download_sticker(_sticker_urls[0]) if _sticker_urls else None
+check_true("dsh-meme 图片能下载成文件", bool(_meme_file))
+if _meme_file:
+    import os as _os
+    _os.remove(_meme_file)
 
 
 # ===========================================================================

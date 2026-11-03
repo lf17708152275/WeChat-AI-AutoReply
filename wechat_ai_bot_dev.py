@@ -1438,6 +1438,8 @@ def sanitize_outgoing_text(text):
         return ""
     # markdown 图片：![alt](url)  以及裸的图片链接行
     t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
+    # 表情插件标记（dsh-meme 正常会被解析成图片；漏到这里就别把方括号原文发给好友）
+    t = re.sub(r"\[表情[:：]\s*[^\]\n]{1,80}\]", "", t)
     # markdown 链接保留文字： [文字](url) -> 文字
     t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
     # 裸 URL（图片/接口地址），整行去掉
@@ -1483,28 +1485,145 @@ def _decision_segments(decision):
 
 # ---------------------------------------------------------------------------
 # 表情包（表情来自 DSH 的表情插件：形如 http://127.0.0.1:25675/x-nekowhale-stickers/s/xxx.gif）
+# dsh-meme 插件（Web 通道）走 /dsh-memes/... 路由，另有 [表情: 描述] 标记写法。
 # ---------------------------------------------------------------------------
 STICKER_PATH_MARK = "/x-nekowhale-stickers/"
+STICKER_PATH_MARKS = ("/x-nekowhale-stickers/", "/dsh-memes/")
+DSH_MEME_BASE = "http://127.0.0.1:25675"
+DSH_MEME_API = DSH_MEME_BASE + "/dsh-memes-api?packId=all"
+MEME_INDEX_TTL = 60.0
 STICKER_MAX_BYTES = 12 * 1024 * 1024
 STICKER_TMP_DIR = "/tmp/wx_bot_stickers"
 _STICKER_LOGGED = set()
+_MEME_INDEX = {"at": 0.0, "rows": []}
+
+
+def _meme_index(force=False):
+    """拉 dsh-meme 的图库索引（60 秒缓存）。失败返回上次结果（可能为空）。"""
+    now = time.time()
+    if not force and _MEME_INDEX["rows"] and now - _MEME_INDEX["at"] < MEME_INDEX_TTL:
+        return _MEME_INDEX["rows"]
+    try:
+        req = urllib.request.Request(DSH_MEME_API, headers={"User-Agent": "wechat-ai-bot/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        rows = []
+        for item in (data.get("memes") or []):
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").lstrip("/")
+            if not path:
+                continue
+            # 插件给的 url 已经带 packId（/dsh-memes/<pack>/memes/...），优先用它
+            url = str(item.get("url") or "").strip()
+            if not url.lower().startswith("/dsh-memes/"):
+                url = "/dsh-memes/" + path
+            rows.append({
+                "path": path,
+                "url": url,
+                "caption": str(item.get("caption") or ""),
+                "tag": str(item.get("tag") or ""),
+                "keywords": str(item.get("keywords") or ""),
+            })
+        if rows:
+            _MEME_INDEX["rows"] = rows
+            _MEME_INDEX["at"] = now
+        return rows or _MEME_INDEX["rows"]
+    except Exception as exc:
+        if "meme_index" not in _STICKER_LOGGED:
+            _STICKER_LOGGED.add("meme_index")
+            log(f"⚠️ [表情] 读取 dsh-meme 图库失败（稍后重试）: {exc}")
+        return _MEME_INDEX["rows"]
+
+
+def _resolve_meme_caption(caption):
+    """把「[表情: 描述]」里的描述换成 dsh-meme 的图片路径（找不到返回 None）。"""
+    target = str(caption or "").strip()
+    if not target:
+        return None
+    # 描述可能是候选原文（caption），也可能带分类/文件名，先整串再拆词
+    rows = _meme_index()
+    if not rows:
+        rows = _meme_index(force=True)
+    if not rows:
+        return None
+
+    def norm(text):
+        return re.sub(r"\s+", "", str(text or "")).lower()
+
+    want = norm(target)
+    exact, prefix, contains = [], [], []
+    for row in rows:
+        caption = norm(row["caption"])
+        if not caption:
+            continue
+        if caption == want:
+            exact.append(row)
+        elif caption.startswith(want) or want.startswith(caption):
+            prefix.append(row)
+        elif want in caption or caption in want:
+            contains.append(row)
+    for bucket in (exact, prefix, contains):
+        if bucket:
+            return bucket[0]["url"]
+    # 描述里只有关键词（「无语」「生气」）时按关键词/分类再找一次
+    for row in rows:
+        words = [norm(w) for w in re.split(r"[\s,，、/]+", (row["caption"] + " " + row["keywords"] + " " + row["tag"]))]
+        if want and any(w and w in want for w in words):
+            return row["url"]
+    return None
+
+
+def _meme_ref_to_url(ref):
+    """把决策里的表情引用归一成可下载的 URL：/dsh-memes/...、绝对路径、http(s) 链接。"""
+    text = str(ref or "").strip()
+    if not text:
+        return None
+    if text.lower().startswith(("http://", "https://")):
+        return text if any(mark in text for mark in STICKER_PATH_MARKS) else None
+    if text.startswith("/dsh-memes/"):
+        return DSH_MEME_BASE + text
+    if text.startswith("memes/") or text.startswith("dsh-memes/"):
+        return DSH_MEME_BASE + "/dsh-memes/" + text
+    if text.startswith("/"):
+        # 插件候选里的绝对路径：映射回 /dsh-memes/ 路由（只允许图库目录下的文件）
+        rel = None
+        for root in (
+            os.path.expanduser("~/.dsh/meme-packs"),
+            "/home/long/.dsh/profiles/web/node_modules/dsh-meme/memes",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "node_modules", "dsh-meme", "memes"),
+        ):
+            try:
+                real_root = os.path.realpath(root)
+                real = os.path.realpath(text)
+                if real == real_root or real.startswith(real_root + os.sep):
+                    # 图库目录结构：<pack>/memes/<tag>/<file>.jpg → /dsh-memes/<pack>/memes/...
+                    rel = "/dsh-memes/" + os.path.relpath(real, real_root).replace(os.sep, "/")
+                    break
+            except Exception:
+                continue
+        return DSH_MEME_BASE + rel if rel else None
+    return None
 
 
 def _decision_stickers(decision):
     """从决策里取出可发送的表情 URL（只认本机/局域网的表情插件链接）。"""
+    out = []
     raw = (decision or {}).get("stickers")
     if isinstance(raw, str):
         raw = [raw]
-    if not isinstance(raw, list):
-        return []
-    out = []
-    for item in raw:
-        url = str(item or "").strip()
-        if not url.lower().startswith(("http://", "https://")):
-            continue
-        if STICKER_PATH_MARK not in url:
-            continue
-        if url not in out:
+    if isinstance(raw, list):
+        for item in raw:
+            url = _meme_ref_to_url(item)
+            if url and url not in out:
+                out.append(url)
+    # dsh-meme：模型给路径（/dsh-memes/...）或给描述（[表情: 描述]）都要能发
+    refs = list((decision or {}).get("meme_paths") or []) + list((decision or {}).get("meme_captions") or [])
+    for ref in refs:
+        url = _meme_ref_to_url(ref)
+        if not url:
+            url = _meme_ref_to_url(_resolve_meme_caption(ref) or "")
+        if url and url not in out:
             out.append(url)
     return out[:2]
 
@@ -1549,18 +1668,42 @@ def download_sticker(url, cfg=None):
         safe_url = urlunparse(("http", netloc, parsed.path, "", parsed.query, ""))
         os.makedirs(STICKER_TMP_DIR, exist_ok=True)
         tail = re.sub(r"[^0-9a-zA-Z]+", "", parsed.path.split("/")[-1]) or "sticker"
-        path = os.path.join(STICKER_TMP_DIR, f"{int(time.time()*1000)}_{tail}.gif")
         req = urllib.request.Request(safe_url, headers={"User-Agent": "wechat-ai-bot/1.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = resp.read(STICKER_MAX_BYTES + 1)
         if not data or len(data) > STICKER_MAX_BYTES:
             log(f"⚠️ [表情] 下载内容为空或过大（{len(data)} 字节）")
             return None
-        if not (data[:3] == b"GIF" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"\xff\xd8"):
+        if data[:3] == b"GIF":
+            ext = ".gif"
+        elif data[:8] == b"\x89PNG\r\n\x1a\n":
+            ext = ".png"
+        elif data[:2] == b"\xff\xd8":
+            ext = ".jpg"
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            ext = ".webp"
+        else:
             log("⚠️ [表情] 下载内容不是图片，跳过")
             return None
+        # 扩展名按真实内容定（dsh-meme 图库里有 jpg/png/webp，GdkPixbuf 靠内容识别，扩展名只影响排查）
+        path = os.path.join(STICKER_TMP_DIR, f"{int(time.time()*1000)}_{tail}{ext}")
         with open(path, "wb") as f:
             f.write(data)
+        if ext not in (".gif", ".png", ".jpg"):
+            # GdkPixbuf 在没有 webp loader 的机器上认不出 webp，先转成 PNG 再进剪贴板
+            try:
+                with Image.open(path) as im:
+                    png_path = os.path.splitext(path)[0] + ".png"
+                    im.convert("RGBA" if "A" in im.getbands() else "RGB").save(png_path, "PNG")
+                os.remove(path)
+                return png_path
+            except Exception as exc:
+                log(f"⚠️ [表情] 图片格式 {ext} 转 PNG 失败: {str(exc)[:80]}")
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return None
         return path
     except Exception as exc:
         log(f"⚠️ [表情] 下载失败: {str(exc)[:120]}")

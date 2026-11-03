@@ -69,9 +69,10 @@ CONTRACT = """你是微信自动回复代理，代替账号主人回复好友消
 - urgency=now 立即发；soon 30-90 秒后发；later 3-15 分钟后发
 - segments/text 只写要发出去的话：不要加引号、不要加说明、不要带 [AI] 之类前缀、不要带序号
 - 不要用书面连接词（首先/其次/此外/总之）、不要列点、不要括号写动作、不要句末客套
-- 想斗图/发表情时：可以调用表情工具（sticker_search / sticker_send），把工具返回的那一行
-  markdown 图片原样放在 JSON 的 "sticker" 字段里（形如 "![摸鱼](http://127.0.0.1:25675/x-nekowhale-stickers/s/xxxx.gif)"）
-  · 一条回复最多 1 张表情，别每句都配图；图片链接不要混进 segments 正文
+- 想斗图/发表情时：先调表情工具（send_meme；老插件是 sticker_search / sticker_send），再把选中的表情放进 JSON：
+  · 推荐：把工具候选里的「描述」原样抄成 "[表情: 描述]" 写进 "sticker" 字段（或放进 segments 某一条），bot 会查图库换成图片再发
+  · 也可以：把候选里的路径原样放进 "sticker" 字段，形如 "/dsh-memes/memes/happy/deyi.jpg"
+  · 一条回复最多 1 张表情，别每句都配图；表情标记不要和正文混在同一条里
   · 表情是锦上添花：对方在难过/说正事时不要发表情
   · 注意：即使要发表情，也**只输出那一行 JSON**，绝对不要直接输出聊天文字或裸 markdown
 - 严禁透露自己是 AI 或机器人"""
@@ -84,6 +85,39 @@ SEGMENT_SPLIT_RE = re.compile(r"\s*\|\|\|\s*")
 MAX_STICKERS = 2
 STICKER_MD_RE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)")
 STICKER_BARE_RE = re.compile(r"(https?://[^\s)\]\[]+/x-nekowhale-stickers/[^\s)\]\[]+)")
+
+# dsh-meme 插件（Web 通道）有两种表情写法，bot 都要能认：
+#   1.「[表情: 描述]」标记（插件系统提示教模型的写法，前端按描述配图）
+#   2. 候选里带路径：/dsh-memes/memes/happy/deyi.jpg（相对）、绝对路径、或带域名 URL
+# 描述本身没有 URL，得回来查图库索引才能找到那张图（见 wechat_ai_bot_dev._resolve_meme_caption）。
+MEME_MARK_RE = re.compile(r"\[表情[:：]\s*([^\]\n]{1,80})\]")
+MEME_REL_RE = re.compile(r"(?<![\w/.])/(dsh-memes/[^\s)\]\"'，。、；;]+)")
+
+
+def split_meme_refs(text):
+    """把 dsh-meme 的「[表情: 描述]」标记和「/dsh-memes/...」路径剥出来。
+
+    返回 (清干净的文字, [描述...], [相对路径...])。
+    描述交给上层查图库索引换成真实图片；路径可以直接拼成表情 URL。
+    """
+    captions = []
+    paths = []
+
+    def take_mark(m):
+        caption = str(m.group(1) or "").strip()
+        if caption and caption not in captions:
+            captions.append(caption)
+        return ""
+
+    def take_path(m):
+        rel = "/" + str(m.group(1) or "").strip().lstrip("/")
+        if rel not in paths:
+            paths.append(rel)
+        return ""
+
+    cleaned = MEME_MARK_RE.sub(take_mark, str(text or ""))
+    cleaned = MEME_REL_RE.sub(take_path, cleaned)
+    return cleaned, captions, paths
 
 
 def split_stickers(text):
@@ -655,17 +689,20 @@ class AgentClient(object):
             # 模型偶尔忘记 JSON：直接回了聊天文字（有时还顺手把表情 markdown 写在后面）。
             # 这种输出比走固定兜底话术好得多，能救就救。
             cleaned, found = split_stickers(text)
-            if not found:
+            cleaned, meme_captions, meme_paths = split_meme_refs(cleaned)
+            if not found and not meme_captions and not meme_paths:
                 return None
             lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
             segments = [" ".join(lines)] if len(lines) > 1 else lines
             segments = [seg.strip(" \"\u201c\u201d") for seg in segments if seg.strip(" \"\u201c\u201d")]
-            if segments or found:
+            if segments or found or meme_captions or meme_paths:
                 return {
                     "action": "reply",
                     "text": "\n".join(segments),
                     "segments": segments[:MAX_SEGMENTS],
                     "stickers": found[:MAX_STICKERS],
+                    "meme_captions": meme_captions[:MAX_STICKERS],
+                    "meme_paths": meme_paths[:MAX_STICKERS],
                     "urgency": "now",
                     "reason": "plain_text_reply",
                 }
@@ -674,8 +711,35 @@ class AgentClient(object):
         action = str(obj.get("action") or "").strip().lower()
         raw_segments = decision_segments(obj)
 
-        # 表情：模型可能把 markdown 塞进 segments/text，也可能走独立字段
+        # 表情：模型可能把 markdown 塞进 segments/text，也可能走独立字段；
+        # dsh-meme 还会给「[表情: 描述]」标记或 /dsh-memes/... 路径，都收进来由 bot 解析。
         stickers = []
+        meme_captions = []
+        meme_paths = []
+
+        def take_memes(piece):
+            _clean, _urls = split_stickers(str(piece or ""))
+            for url in _urls:
+                if url not in stickers:
+                    stickers.append(url)
+            after_md, caps, paths = split_meme_refs(_clean)
+            for caption in caps:
+                if caption not in meme_captions:
+                    meme_captions.append(caption)
+            for rel in paths:
+                if rel not in meme_paths:
+                    meme_paths.append(rel)
+            # 独立字段里也可能直接是裸的 /dsh-memes/... 或绝对路径：split_meme_refs 只认带斜杠的相对路径，
+            # 这里再兜一层显式路径。
+            bare = str(piece or "").strip()
+            if bare.startswith("/dsh-memes/"):
+                if bare not in meme_paths:
+                    meme_paths.append(bare)
+            elif bare.startswith("/") and ("/dsh-meme" in bare or "/meme" in bare.lower()) and " " not in bare:
+                if bare not in meme_paths:
+                    meme_paths.append(bare)
+            return after_md
+
         explicit = obj.get("sticker")
         if explicit is None:
             explicit = obj.get("stickers")
@@ -684,28 +748,24 @@ class AgentClient(object):
         if isinstance(explicit, list):
             for item in explicit:
                 if isinstance(item, dict):
-                    item = item.get("url") or item.get("text") or ""
-                _clean, found = split_stickers(item)
-                for url in found:
-                    if url not in stickers:
-                        stickers.append(url)
+                    item = item.get("url") or item.get("text") or item.get("path") or ""
+                take_memes(item)
 
         segments = []
         for seg in raw_segments:
-            cleaned, found = split_stickers(seg)
-            for url in found:
-                if url not in stickers:
-                    stickers.append(url)
+            cleaned = take_memes(seg)
             if cleaned:
                 segments.append(cleaned)
         stickers = stickers[:MAX_STICKERS]
+        meme_captions = meme_captions[:MAX_STICKERS]
+        meme_paths = meme_paths[:MAX_STICKERS]
         out_text = "\n".join(segments)
 
         if action not in ACTION_SET:
             # 模型忘了给 action：有正文就当 reply，没正文就当 ignore
             action = "reply" if segments else "ignore"
 
-        if action == "reply" and not segments and not stickers:
+        if action == "reply" and not segments and not stickers and not meme_captions and not meme_paths:
             # 说要回却既没正文也没表情 —— 视为坏输出，走降级兜底
             return None
         urgency = str(obj.get("urgency") or "").strip().lower()
@@ -718,6 +778,8 @@ class AgentClient(object):
             "text": out_text,
             "segments": segments,
             "stickers": stickers,
+            "meme_captions": meme_captions,
+            "meme_paths": meme_paths,
             "urgency": urgency,
             "reason": reason,
         }
@@ -732,6 +794,8 @@ class AgentClient(object):
             "text": text,
             "segments": [text],
             "stickers": [],
+            "meme_captions": [],
+            "meme_paths": [],
             "urgency": "now",
             "reason": "agent_unavailable",
         }

@@ -226,7 +226,7 @@ print("\n=== 3b-3. A2A 决策契约编辑器（留空=内置） ===")
 check_true("「人设与指令 Prompt」页有契约编辑框", hasattr(app, "txt_contract"))
 _contract_default = app.txt_contract.get("1.0", tk.END).strip()
 check_true("默认载入内置契约", "只输出一行 JSON" in _contract_default)
-check_true("内置契约含表情规则", "sticker_search" in _contract_default)
+check_true("内置契约含表情规则", "send_meme" in _contract_default and "[表情:" in _contract_default)
 
 _custom_contract = '你是测试用契约，只输出 {"action":"ignore"}'
 app.txt_contract.delete("1.0", tk.END)
