@@ -5,6 +5,7 @@ import time
 import re
 import tempfile
 import threading
+import queue
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -284,25 +285,47 @@ class WeChatBotGUI(tk.Tk):
         self.is_monitoring = True
         self._confirm_dialog_open = False
         self._bot_running_cache = False   # 后台状态轮询写入，供"启停开关"按钮显示当前状态
+        self._ui_queue = queue.Queue()    # 后台线程 → 主线程的 UI 回调队列（Tk 的 after 不能跨线程用）
+        self._agent_session_cache = None  # 备注 → A2A contextId；后台每 3s 自动同步，None=还没拉过
+        self._sessions_poll_at = 0.0
+        self._sessions_sync_at = ""
 
         self.create_widgets()
         self.load_settings_to_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.start_background_monitors()
+        self._safe_after(120, self._drain_ui_queue)
         # P3: 待确认消息轮询（2 秒一次，有就弹窗）
         self._safe_after(2500, self.poll_pending_confirm)
 
     def _ui_call(self, fn, delay=0):
-        """后台线程回主线程改 UI 的安全版本（窗口已关闭 / 无 mainloop 时静默跳过）。"""
-        def _guarded():
+        """后台线程回主线程改 UI：只往队列里塞，主线程定时 drain 执行。
+
+        不能直接用 self.after(...) —— tkinter 不是线程安全的，从后台线程碰 Tcl 会抛
+        RuntimeError（"main thread is not in main loop"），旧实现把它 except 掉了，
+        于是状态栏/日志/会话 id 的更新会静默丢失。
+        """
+        try:
+            self._ui_queue.put((delay, fn))
+            return True
+        except Exception:
+            return False
+
+    def _drain_ui_queue(self):
+        """主线程：把后台线程投递的 UI 回调执行掉，然后排下一次。"""
+        if getattr(self, "_closing", False):
+            return
+        budget = time.time() + 0.20
+        while time.time() < budget:
+            try:
+                _delay, fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
             try:
                 fn()
             except Exception:
                 pass
-        try:
-            self.after(delay, _guarded)
-        except Exception:
-            pass
+        self._safe_after(100, self._drain_ui_queue)
 
     def _safe_after(self, ms, fn):
         """登记 after 定时器，关窗时统一取消，避免 Tk 打印 invalid command name 堆栈。"""
@@ -891,9 +914,11 @@ class WeChatBotGUI(tk.Tk):
         except Exception:
             return None
 
-    def _agent_sessions(self):
-        """{备注: 当前 contextId}；bot 没运行就返回空表。"""
+    def _agent_sessions(self, strict=False):
+        """{备注: 当前 contextId}；bot 没运行就返回空表（strict 时返回 None 以便区分失败）。"""
         data = self._bot_api_json("/sessions")
+        if strict and not isinstance(data, dict):
+            return None
         out = {}
         if isinstance(data, dict):
             for item in data.get("sessions") or []:
@@ -943,6 +968,97 @@ class WeChatBotGUI(tk.Tk):
             vals = self.tree_contacts.item(sel[0], "values")
             remark = str(vals[0]).strip() if vals else ""
         self._update_contact_agent_info(remark)
+        self._sessions_sync_at = time.strftime("%H:%M:%S")
+        self._update_sessions_sync_label()
+
+    def _selected_contact_remark(self):
+        """当前选中行的备注；没选中返回空串。"""
+        tree = getattr(self, "tree_contacts", None)
+        if tree is None:
+            return ""
+        try:
+            sel = tree.selection()
+            if not sel:
+                return ""
+            vals = tree.item(sel[0], "values")
+            return str(vals[0]).strip() if vals else ""
+        except Exception:
+            return ""
+
+    def _apply_sessions_update(self, sessions):
+        """主线程：把最新的 /sessions 快照刷到表格第 4 列和右侧文案（不重建整表，选中不丢）。
+
+        返回 True 表示确实有变化。
+        """
+        sessions = dict(sessions or {})
+        if getattr(self, "_agent_session_cache", None) == sessions:
+            return False
+        self._agent_session_cache = sessions
+        tree = getattr(self, "tree_contacts", None)
+        if tree is not None:
+            selected = set(tree.selection())
+            for item in tree.get_children():
+                try:
+                    vals = list(tree.item(item, "values"))
+                except Exception:
+                    continue
+                if not vals:
+                    continue
+                remark = str(vals[0]).strip()
+                while len(vals) < 4:
+                    vals.append("")
+                new_ctx = sessions.get(remark, "")
+                if str(vals[3]) != new_ctx:
+                    vals[3] = new_ctx
+                    try:
+                        tree.item(item, values=tuple(vals[:4]))
+                    except Exception:
+                        pass
+            # 原地改 values 后选中态理论不会丢，这里再护一次
+            for item in selected:
+                try:
+                    if tree.exists(item):
+                        tree.selection_add(item)
+                except Exception:
+                    pass
+        self._sessions_sync_at = time.strftime("%H:%M:%S")
+        self._update_contact_agent_info(self._selected_contact_remark())
+        self._update_sessions_sync_label()
+        return True
+
+    _SESSIONS_POLL_INTERVAL = 3.0
+
+    def _poll_agent_sessions_once(self):
+        """后台线程调用：按节流间隔拉一次 /sessions，有变化就投递主线程刷新。
+
+        返回 True 表示这次真的取到了新快照并已投递 UI 更新。
+        """
+        now = time.time()
+        if now - getattr(self, "_sessions_poll_at", 0.0) < self._SESSIONS_POLL_INTERVAL:
+            return False
+        self._sessions_poll_at = now
+        try:
+            sessions = self._agent_sessions(strict=True)
+        except Exception:
+            return False
+        if sessions is None:
+            return False
+        if sessions == (getattr(self, "_agent_session_cache", None) or {}):
+            return False
+        self._ui_call(lambda s=sessions: self._apply_sessions_update(s))
+        return True
+
+    def _update_sessions_sync_label(self):
+        lbl = getattr(self, "lbl_ct_session_sync", None)
+        if lbl is None:
+            return
+        try:
+            if self._sessions_sync_at:
+                lbl.configure(text=f"↻ 会话 id 每 3 秒自动同步（最近 {self._sessions_sync_at}）")
+            else:
+                lbl.configure(text="↻ 会话 id 每 3 秒自动同步")
+        except Exception:
+            pass
 
     def rotate_selected_contact(self):
         """把选中联系人的会话换成一个全新的（写 bot 的轮换表，下一条消息起生效）。"""
@@ -1032,7 +1148,11 @@ class WeChatBotGUI(tk.Tk):
         self.lbl_ct_session = ttk.Label(sess_box, text="当前会话：—",
                                         foreground="#333333", font=("微软雅黑", 8), wraplength=250,
                                         justify=tk.LEFT)
-        self.lbl_ct_session.pack(anchor=tk.W, pady=(2, 4))
+        self.lbl_ct_session.pack(anchor=tk.W, pady=(2, 0))
+        self.lbl_ct_session_sync = ttk.Label(sess_box, text="↻ 会话 id 每 3 秒自动同步",
+                                             foreground="#8a8a8a", font=("微软雅黑", 8), wraplength=250,
+                                             justify=tk.LEFT)
+        self.lbl_ct_session_sync.pack(anchor=tk.W, pady=(0, 4))
         ttk.Button(sess_box, text="🔄 换新会话（下一条消息生效）",
                    command=self.rotate_selected_contact).pack(fill=tk.X, pady=2)
         ttk.Button(sess_box, text="🔄 刷新会话状态", command=self.refresh_agent_sessions).pack(fill=tk.X, pady=2)
@@ -2385,6 +2505,12 @@ class WeChatBotGUI(tk.Tk):
                             self.log_pos = f.tell()
                     except Exception:
                         pass
+
+                # 4. 通讯录「当前会话」实时同步（每 3s 拉一次 /sessions，变了才回主线程刷表）
+                try:
+                    self._poll_agent_sessions_once()
+                except Exception:
+                    pass
 
                 if not self.is_monitoring:
                     break

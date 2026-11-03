@@ -255,6 +255,90 @@ _saved_contract2 = json.load(open(tmp_cfg, encoding="utf-8"))
 check("内置契约=默认时存空串（跟随内置）",
       (_saved_contract2.get("agent") or {}).get("contract"), "")
 
+print("\n=== 3b-4. 通讯录「当前会话」实时同步 ===")
+_old_contacts = list(app.config_data.get("contacts") or [])
+_old_cache = app._agent_session_cache
+try:
+    app.config_data["contacts"] = [
+        {"remark": "张三", "wxid": "zhangsan_88", "relation": "家人"},
+        {"remark": "李四", "wxid": "lisi_007", "relation": "损友"},
+    ]
+    app._agent_session_cache = {}
+    app._refresh_contacts_tree()
+    app.update()
+    _rows = {app.tree_contacts.item(i, "values")[0]: app.tree_contacts.item(i, "values")[3]
+             for i in app.tree_contacts.get_children()}
+    check("初始会话列为空", _rows, {"张三": "", "李四": ""})
+
+    _first = app.tree_contacts.get_children()[0]
+    app.tree_contacts.selection_set(_first)
+    app.update()
+    check_true("拉到的会话 id 能刷进表格（后台轮询走的就是这个方法）",
+               app._apply_sessions_update({"张三": "ctx-111", "李四": "ctx-222"}))
+    _rows = {app.tree_contacts.item(i, "values")[0]: app.tree_contacts.item(i, "values")[3]
+             for i in app.tree_contacts.get_children()}
+    check("两行会话 id 都更新", _rows, {"张三": "ctx-111", "李四": "ctx-222"})
+    check_true("原地刷新不丢选中", app.tree_contacts.selection() == (_first,))
+    check_true("右侧「当前会话」文案跟着变",
+               "ctx-111" in str(app.lbl_ct_session.cget("text")))
+    check_true("有自动同步的时间提示",
+               "自动同步" in str(app.lbl_ct_session_sync.cget("text")))
+
+    check_true("bot 自动换会话后（id 再变）也能刷新",
+               app._apply_sessions_update({"张三": "ctx-333"}))
+    _rows = {app.tree_contacts.item(i, "values")[0]: app.tree_contacts.item(i, "values")[3]
+             for i in app.tree_contacts.get_children()}
+    check("更新后的新 id", _rows.get("张三"), "ctx-333")
+    check_true("快照没变化时不重复刷（返回 False）",
+               app._apply_sessions_update({"张三": "ctx-333"}) is False)
+
+    _orig_api = app._bot_api_json
+    app._bot_api_json = lambda path, payload=None, timeout=2.0: None
+    try:
+        check("bot 没跑时 strict=True 返回 None（轮询不会把表刷空）",
+              app._agent_sessions(strict=True), None)
+        check("非 strict 仍返回空表（兼容旧调用）", app._agent_sessions(), {})
+    finally:
+        app._bot_api_json = _orig_api
+
+    # 后台轮询入口本身：拉一次→投递主线程→表格跟着变；并且有 3s 节流
+    _orig_sessions = app._agent_sessions
+    app._agent_sessions = lambda strict=False: {"张三": "ctx-live"}
+    app._agent_session_cache = {"张三": "ctx-333"}
+    app._sessions_poll_at = 0.0
+    try:
+        check_true("后台轮询取到新快照会投递刷新", app._poll_agent_sessions_once())
+
+        def _pump_until(pred, timeout=2.0):
+            end = time.time() + timeout
+            while time.time() < end:
+                app.update(); time.sleep(0.02)
+                if pred():
+                    return True
+            return False
+
+        check_true("投递到主线程后表格更新（队列 drain）",
+                   _pump_until(lambda: (app.tree_contacts.item(app.tree_contacts.get_children()[0], "values")[3]
+                                        if app.tree_contacts.get_children() else "") == "ctx-live"))
+        _rows = {app.tree_contacts.item(i, "values")[0]: app.tree_contacts.item(i, "values")[3]
+                 for i in app.tree_contacts.get_children()}
+        check("轮询后表格显示新 id", _rows.get("张三"), "ctx-live")
+        check("3 秒内不会重复请求", app._poll_agent_sessions_once(), False)
+
+        app._agent_sessions = lambda strict=False: None
+        app._sessions_poll_at = 0.0
+        check("接口失败时不刷新、也不清空表格", app._poll_agent_sessions_once(), False)
+        _rows = {app.tree_contacts.item(i, "values")[0]: app.tree_contacts.item(i, "values")[3]
+                 for i in app.tree_contacts.get_children()}
+        check("失败后旧 id 仍保留", _rows.get("张三"), "ctx-live")
+    finally:
+        app._agent_sessions = _orig_sessions
+finally:
+    app.config_data["contacts"] = _old_contacts
+    app._agent_session_cache = _old_cache
+    app._refresh_contacts_tree()
+    app.update()
+
 print("\n=== 3c. 底部实时日志监听 ===")
 check_true("日志面板在主区域分栏内（拖不出来也挤不掉）",
            len(app.main_pane.panes()) == 2 and int(app.txt_log.winfo_height()) > 60)
