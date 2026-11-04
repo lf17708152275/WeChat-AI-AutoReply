@@ -303,10 +303,10 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
    curl -X POST http://127.0.0.1:25675/dsh-breeze-tts-api/speak-preview \
         -H 'Content-Type: application/json' -d '{"input":"你好"}' -o /tmp/t.wav
    ```
-   > ⏱️ 纯 CPU（比如 i5-4210U）合成速度约 **0.04x 实时**：5 秒语音要 ~2.5 分钟。
-   > 这是本机算力限制，不是 bug；想快就把 Breeze 跑在有 GPU 的机器上，或把
-   > `max_chars` 调小、让模型只说短句。合成期间 bot 会先写日志
-   > `🎙️ [语音] 正在合成 …（纯 CPU 合成通常要 1-3 分钟）`。
+   > ⏱️ 速度取决于 Breeze 服务跑在哪台机器：
+   > 本机纯 CPU（i5-4210U）约 **0.04x 实时**（5 秒语音要 ~2.5 分钟）；
+   > 局域网里另一台带 GPU 的机器（例如 `192.168.31.141`）通常 **几秒** 就能合成。
+   > 把 `endpoint` 指到快的那台即可，插件和 bot 都不用改。
 3. 微信里有可发送的会话（白名单里的人）。
 
 发送流程：`voice_texts` → `voice_tts.synthesize()`（优先 Breeze，按 magic 判扩展名）→

@@ -2166,7 +2166,7 @@ def _deliver_voices(target, voice_texts, signature, hwnd, rect, layout, cfg, sou
             continue
         if len(said) > vcfg["max_chars"]:
             said = said[: vcfg["max_chars"]]
-        log(f"🎙️ [语音] 正在合成 {len(said)} 字…（纯 CPU 合成通常要 1-3 分钟）")
+        log(f"🎙️ [语音] 正在合成 {len(said)} 字…（时长取决于 TTS 服务算力）")
         try:
             info = voice_tts.synthesize(
                 said,
