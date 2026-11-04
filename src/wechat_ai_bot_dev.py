@@ -3672,7 +3672,12 @@ def scan_and_reply_wechat(hwnd):
     curr_chat_hash = hashlib.md5(chat_patch.tobytes()).hexdigest()
     
     sidebar_patch = arr_wechat[:, :layout["chat_start_x"]]
-    sr, sg, sb = sidebar_patch[:, :, 0].astype(int), sidebar_patch[:, :, 1].astype(int), sidebar_patch[:, :, 2].astype(int)
+    # 红点只在「会话列表列」里找：左侧图标栏的未读小圆点（微信图标上的红点）常年存在，
+    # 若把它算进来，has_red_pixels 永远为 True，哨兵永远不会跳过 → 空转 OCR 吃满 CPU。
+    _rz0 = int(layout.get("sidebar_w") or 0)
+    _rz1 = int(layout["chat_start_x"])
+    red_patch = arr_wechat[:, _rz0:_rz1] if _rz1 > _rz0 else sidebar_patch
+    sr, sg, sb = red_patch[:, :, 0].astype(int), red_patch[:, :, 1].astype(int), red_patch[:, :, 2].astype(int)
     red_mask = (sr >= 190) & (sg <= 115) & (sb <= 115) & (sr > sg + 55)
     has_red_pixels = np.sum(red_mask) >= 15
     
