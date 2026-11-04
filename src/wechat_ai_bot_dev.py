@@ -1658,7 +1658,7 @@ def _voice_cfg(cfg=None):
         "instruction": str(raw.get("instruction") or ""),
         "edge_fallback": bool(raw.get("edge_fallback", True)),
         "edge_voice": str(raw.get("edge_voice") or "zh-CN-XiaoxuanNeural"),
-        "timeout": float(raw.get("timeout") or 180.0),
+        "timeout": float(raw.get("timeout") or 300.0),
         "mode": mode,
         "fallback_file": bool(raw.get("fallback_file", True)),
         "virtual_source": str(raw.get("virtual_source") or "wx_tts_source"),
@@ -2166,6 +2166,7 @@ def _deliver_voices(target, voice_texts, signature, hwnd, rect, layout, cfg, sou
             continue
         if len(said) > vcfg["max_chars"]:
             said = said[: vcfg["max_chars"]]
+        log(f"🎙️ [语音] 正在合成 {len(said)} 字…（纯 CPU 合成通常要 1-3 分钟）")
         try:
             info = voice_tts.synthesize(
                 said,

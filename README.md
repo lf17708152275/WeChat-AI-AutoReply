@@ -241,7 +241,8 @@ Agent 返回的契约（一行 JSON）：
 ### 🎙️ 语音消息（可选，需 dsh-breeze-tts）
 
 Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice": "要说的那句话"`（或在 `segments` 里写
-`[语音: 文本]`），bot 调 DSH 的 **dsh-breeze-tts** 插件合成音频，再用「文件消息」发出去。
+`[语音: 文本]`），bot 调 DSH 的 **dsh-breeze-tts** 插件合成音频，再用**虚拟麦克风 + 按住说话**发成
+微信里真正的语音气泡（对方看到的是绿色语音条，可直接播放）。
 
 > 💡 怎么发出真·语音气泡：WeChat Linux 4.1.x 的语音入口不是输入栏那个麦克风（那个是「语音输入文字」），
 > 而是右侧的 **「发语音」按钮**（悬停提示为「发语音」，窗口宽度约 85.3% 处）。点它后输入栏会变成
@@ -263,7 +264,7 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
             "instruction": "",
             "edge_fallback": true,
             "edge_voice": "zh-CN-XiaoxuanNeural",
-            "timeout": 180,
+            "timeout": 300,
             "fallback_file": true,
             "virtual_source": "wx_tts_source",
             "virtual_sink": "wx_tts_sink",
@@ -302,13 +303,18 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
    curl -X POST http://127.0.0.1:25675/dsh-breeze-tts-api/speak-preview \
         -H 'Content-Type: application/json' -d '{"input":"你好"}' -o /tmp/t.wav
    ```
+   > ⏱️ 纯 CPU（比如 i5-4210U）合成速度约 **0.04x 实时**：5 秒语音要 ~2.5 分钟。
+   > 这是本机算力限制，不是 bug；想快就把 Breeze 跑在有 GPU 的机器上，或把
+   > `max_chars` 调小、让模型只说短句。合成期间 bot 会先写日志
+   > `🎙️ [语音] 正在合成 …（纯 CPU 合成通常要 1-3 分钟）`。
 3. 微信里有可发送的会话（白名单里的人）。
 
 发送流程：`voice_texts` → `voice_tts.synthesize()`（优先 Breeze，按 magic 判扩展名）→
 顶栏核验并切到目标会话 → 建/复用虚拟麦克风并把默认录音设备切过去 → 点「发语音」→ 按住说话条的同时
 `paplay` 播放合成音频 → 松开自动发送 → 恢复默认录音设备 → 日志 `🎙️ [语音] 已发语音气泡【张三】`。
 离屏隐藏模式下会先临时召回窗口、发完再回到隐藏态；发送前同样核验顶栏，防止发错人。
-需要系统有 `pulseaudio-utils`（提供 `pactl`/`paplay`），Debian 上 `sudo apt install pulseaudio-utils`。
+需要系统有 `pulseaudio-utils`（提供 `pactl`/`paplay`）、一份可用的 Breeze-TTS-2 模型
+（本机实测 `breeze-tts-2-q4_k.gguf` 2.5GB，跑在 CPU 上）。
 
 ### 📤 主动发送（可选）
 
@@ -496,6 +502,21 @@ bot 依旧能抓图 / OCR / 发消息（已实测离屏静默发送成功）。�
 
 Linux 依赖安装（无 pip 环境的手动装法）、`DISPLAY` / `XAUTHORITY` 设置、七套回归测试的跑法，
 见 **[docs/Linux移植规划.md](docs/Linux移植规划.md)** 与本文档「🧪 回归测试」一节。
+
+### 🪟 微信客户端启动方式（Linux / xrdp）
+
+在没有 GPU 的 Xorg（例如 xrdp 的 `:10`）上，微信的 Qt 有时会 GPU 初始化失败：窗口明明
+`mapped/viewable`，但内容永远是旧像素，截图抓到的是别的窗口，bot 也就「看不到」微信。
+
+启动微信时强制软件渲染即可避免，仓库里带了脚本：
+
+```bash
+./scripts/launch_wechat_softgl.sh          # 等价于带一堆 QT_*/LIBGL_* 环境变量启动 /usr/bin/wechat
+```
+
+它设置了 `LIBGL_ALWAYS_SOFTWARE=1`、`QT_OPENGL=software`、`QT_QUICK_BACKEND=software`、
+`QSG_RENDER_LOOP=basic`、`QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-gpu-compositing"`。
+把桌面快捷方式/自启动的 `Exec=` 指到这个脚本即可。
 
 ### 🖥️ 桌面合成器校验（Linux）
 

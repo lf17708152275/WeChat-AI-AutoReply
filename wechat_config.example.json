@@ -66,7 +66,7 @@
       "instruction": "",
       "edge_fallback": true,
       "edge_voice": "zh-CN-XiaoxuanNeural",
-      "timeout": 180,
+      "timeout": 300,
       "fallback_file": true,
       "virtual_source": "wx_tts_source",
       "virtual_sink": "wx_tts_sink",
