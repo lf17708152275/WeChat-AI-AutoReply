@@ -739,6 +739,17 @@ _voice_only_bubbles = _wb.parse_chat_bubbles_chromatic(_voice_only_res, _voice_i
 _voice_only_pending, _voice_only_text = _wb.extract_pending_incoming_messages(_voice_only_bubbles)
 check("没转出文字时不拿时长当正文", _voice_only_text, _wb.VOICE_ONLY_PLACEHOLDER)
 
+# 微信自动转文字会渲染在语音气泡正下方（无边框，间距常 >40px），要吸附成同一条消息
+_voice_attach_res = [
+    ([[574, 429], [633, 429], [633, 452], [574, 452]], ') 3"', 0.9),
+    ([[570, 495], [798, 495], [798, 515], [570, 515]], "想听一下你女生的声音。", 0.9),
+]
+_voice_attach_bubbles = _wb.parse_chat_bubbles_chromatic(_voice_attach_res, _voice_img, _voice_layout)
+check("转写文字吸附进语音气泡", _voice_attach_bubbles[0]["text"], "想听一下你女生的声音。")
+check_true("语音转写不会重复成第二条消息",
+           len([b for b in _voice_attach_bubbles if (b.get("text") or "").strip()]) == 1)
+check("吸附后仍是语音气泡", _voice_attach_bubbles[0].get("is_voice"), True)
+
 
 print("=== 5.7 语音发送解析（voice 字段 / [语音: 文本] 标记）===")
 _clean_v, _said_v = agent_client.split_voice_refs("好呀[语音: 我这就过去哈]")

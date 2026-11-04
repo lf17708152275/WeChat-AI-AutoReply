@@ -1003,6 +1003,7 @@ def _normalize_voice_text(text):
     t = (text or "").strip()
     if not t:
         return "", False
+    original = t
     is_voice = False
     for hint in VOICE_HINT_WORDS:
         if hint in t:
@@ -1012,8 +1013,9 @@ def _normalize_voice_text(text):
     if m:
         t = t[m.end():].strip()
         is_voice = True
-    t = t.strip(" ，,。;；:：")
-    return t, is_voice
+    if not is_voice:
+        return original, False
+    return t.strip(" ，,。;；:："), True
 
 def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
     arr = np.array(img_rgb)
@@ -1104,6 +1106,18 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
                 'text': text
             })
 
+    # 微信「语音消息自动转成文字」会把转写文字渲染在语音气泡正下方（无气泡边框，
+    # 垂直间距约 50~95px，超过普通多行气泡的 40px 合并阈值），这里做一次吸附合并。
+    for i in range(len(merged_bubbles) - 1):
+        cur, nxt = merged_bubbles[i], merged_bubbles[i + 1]
+        if (cur.get('is_voice') and not (cur.get('text') or '').strip()
+                and nxt.get('is_incoming') and not nxt.get('is_voice')):
+            gap = nxt.get('first_y', 0) - cur.get('last_y', 0)
+            if 0 < gap <= 100 and abs(nxt.get('box_left', 0) - cur.get('box_left', 0)) <= 80:
+                cur['text'] = nxt.get('text') or ''
+                cur['last_y'] = nxt.get('last_y', cur['last_y'])
+                nxt['text'] = ''   # 已经是上面语音气泡的转写，不再单独算一条消息
+
     return merged_bubbles
 
 def extract_pending_incoming_messages(chat_bubbles):
@@ -1130,7 +1144,9 @@ def extract_pending_incoming_messages(chat_bubbles):
     # 用明确占位符让模型自然地请对方重说/打字。
     for b in pending_bubbles:
         if b.get('is_voice') and not (b.get('text') or '').strip():
+            b['voice_missing_text'] = True
             b['text'] = VOICE_ONLY_PLACEHOLDER
+    pending_bubbles = [b for b in pending_bubbles if (b.get('text') or '').strip()]
 
     texts = [b['text'].strip() for b in pending_bubbles if b['text'].strip()]
     combined_text = "，".join(texts)
@@ -3771,10 +3787,7 @@ def scan_and_reply_wechat(hwnd):
         if chat_bubbles:
             pending_bubbles, combined_text = extract_pending_incoming_messages(chat_bubbles)
             # 🎤 语音消息：只看到时长、还没转出文字时，等微信自动转写后重扫一次
-            if pending_bubbles and any(
-                b.get('is_voice') and (b.get('text') or '').strip() == VOICE_ONLY_PLACEHOLDER
-                for b in pending_bubbles
-            ):
+            if pending_bubbles and pending_bubbles[-1].get('voice_missing_text'):
                 log(f"🎤 [语音] 收到【{current_active_target}】的语音，等待微信自动转文字…")
                 retried = _retry_voice_transcript(hwnd, layout, ignored_keywords, pending_bubbles)
                 if retried:
