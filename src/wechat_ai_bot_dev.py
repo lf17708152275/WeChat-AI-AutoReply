@@ -159,6 +159,8 @@ ocr_engine = init_ocr()
 # 2. CONFIGURATION & STATE MANAGEMENT
 # =============================================================================
 LAST_PROCESSED_SIGNATURE = {}
+LAST_PROCESSED_AT = {}          # target -> 最近一次「登记为已处理」的时间戳
+SKIP_LOG_AT = {}               # (target, reason) -> 上次输出跳过日志的时间
 API_CONVERSATION_HISTORY = {}
 LAST_CLICKED_CANDIDATE_TIME = {}
 SEND_FAIL_RETRY = {}
@@ -1441,6 +1443,7 @@ def _deliver_reply(target, texts, signature, hwnd, rect, layout, cfg, source="sc
         SEND_FAIL_RETRY[signature] = fail_count
         if fail_count >= 2:
             LAST_PROCESSED_SIGNATURE[target] = signature
+            LAST_PROCESSED_AT[target] = time.time()
             SEND_FAIL_RETRY.pop(signature, None)
             log(f"🚫 [重试超限熔断] 好友【{target}】消息连续 2 次发送脱靶，已放弃该条回复以防死循环。")
             return False
@@ -1458,6 +1461,8 @@ def _deliver_reply(target, texts, signature, hwnd, rect, layout, cfg, source="sc
         return False
 
     LAST_PROCESSED_SIGNATURE[target] = signature
+
+    LAST_PROCESSED_AT[target] = time.time()
     SEND_FAIL_RETRY.pop(signature, None)
     return True
 
@@ -2352,11 +2357,13 @@ def poll_agent_results(hwnd, rect=None, layout=None):
 
         if action == "ignore":
             LAST_PROCESSED_SIGNATURE[target] = signature
+            LAST_PROCESSED_AT[target] = time.time()
             log(f"🙊 [Agent 判定不回] 好友【{target}】: {reason}  (耗时 {cost:.1f}s)")
             continue
 
         if action == "defer":
             LAST_PROCESSED_SIGNATURE[target] = signature
+            LAST_PROCESSED_AT[target] = time.time()
             delay = client.urgency_to_seconds(urgency) if client else 60.0
             if segments or stickers or voices:
                 _schedule_outbox(target, segments, signature, delay, "defer", stickers=stickers, voices=voices)
@@ -2368,11 +2375,13 @@ def poll_agent_results(hwnd, rect=None, layout=None):
         if not segments and not stickers and not voices:
             log(f"⚠️ [Agent 空回复] 好友【{target}】无正文也无表情，跳过")
             LAST_PROCESSED_SIGNATURE[target] = signature
+            LAST_PROCESSED_AT[target] = time.time()
             continue
 
         delay = client.urgency_to_seconds(urgency) if client else 0.0
         if delay > 0:
             LAST_PROCESSED_SIGNATURE[target] = signature
+            LAST_PROCESSED_AT[target] = time.time()
             _schedule_outbox(target, segments, signature, delay, "agent", stickers=stickers, voices=voices)
             continue
 
@@ -2426,10 +2435,12 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
 
     if action == "ignore":
         LAST_PROCESSED_SIGNATURE[target] = signature
+        LAST_PROCESSED_AT[target] = time.time()
         log(f"🙊 [Agent 判定不回·同步] 好友【{target}】: {reason}")
         return False
     if action == "defer":
         LAST_PROCESSED_SIGNATURE[target] = signature
+        LAST_PROCESSED_AT[target] = time.time()
         client = get_agent_client(cfg)
         delay = client.urgency_to_seconds(urgency) if client else 60.0
         if segments:
@@ -2437,12 +2448,14 @@ def _handle_decision_sync(target, message, signature, decision, hwnd, rect, layo
         return False
     if not segments and not stickers and not voices:
         LAST_PROCESSED_SIGNATURE[target] = signature
+        LAST_PROCESSED_AT[target] = time.time()
         return False
 
     client = get_agent_client(cfg)
     delay = client.urgency_to_seconds(urgency) if client else 0.0
     if delay > 0:
         LAST_PROCESSED_SIGNATURE[target] = signature
+        LAST_PROCESSED_AT[target] = time.time()
         _schedule_outbox(target, segments, signature, delay, "agent-sync", stickers=stickers, voices=voices)
         return False
 
@@ -3651,7 +3664,9 @@ def scan_and_reply_wechat(hwnd):
     crop_x1 = max(330, int(layout["chat_start_x"] + 10))
     crop_y1 = max(0, int(layout["header_h"] + 10))
     crop_x2 = min(W, int(W - 5))
-    crop_y2 = min(H, int(H - int(layout["input_h"] * 0.70)))
+    # 血泪坑：输入框上沿有闪烁光标，若把输入区算进哨兵，hash 每秒都变，
+    # 会导致「永远全量 OCR」（CPU 70%+）且连发沉降判定永远误判。
+    crop_y2 = max(crop_y1 + 20, min(H, int(H - layout["input_h"] - 8)))
     
     chat_patch = arr_wechat[crop_y1:crop_y2, crop_x1:crop_x2]
     curr_chat_hash = hashlib.md5(chat_patch.tobytes()).hexdigest()
@@ -3757,6 +3772,10 @@ def scan_and_reply_wechat(hwnd):
     # 轨 2: 右侧微观聊天区 (提取顶栏标题 & 消息气泡)
     # -------------------------------------------------------------------------
     active_right_title = extract_active_chat_title(res, layout)
+    if not active_right_title:
+        # 整幅 OCR 经常漏掉 2~3 个字的顶栏标题（detection 阈值问题）→ 裁顶栏单独 OCR 兜底。
+        # 血泪坑：少了这一步，主循环会一直显示「顶栏空」→ 认不出当前会话 → 静默不回复。
+        active_right_title = _ocr_header_title(img_wechat, layout)
     
     # -------------------------------------------------------------------------
     # 🌟 会话目标识别与门禁 (Whitelist Gating / Non-Whitelist Firewall)
@@ -3782,6 +3801,12 @@ def scan_and_reply_wechat(hwnd):
             clean_green = re.sub(r'^\d{1,2}(?=[^\d])', '', active_green_text).strip()
             current_active_target = re.split(r'\s+', clean_green, maxsplit=1)[0].strip()
     
+    if not current_active_target:
+        _k = ("__target__", "none")
+        if now_ts - SKIP_LOG_AT.get(_k, 0) >= 60.0:
+            SKIP_LOG_AT[_k] = now_ts
+            log(f"🔍 [巡检] 未识别当前好友：顶栏「{active_right_title or '空'}」 绿色会话「{(active_green_text or '')[:16]}」")
+
     if current_active_target:
         chat_bubbles = parse_chat_bubbles_chromatic(res, img_wechat, layout, ignored_keywords)
         if chat_bubbles:
@@ -3796,6 +3821,19 @@ def scan_and_reply_wechat(hwnd):
             # 🔥 第一道铁闸：只要当前好友有未回复新消息，绝对锁定在当前窗口就地秒回！
             if pending_bubbles and combined_text:
                 current_sig = _msg_signature(current_active_target, combined_text, pending_bubbles)
+                if LAST_PROCESSED_SIGNATURE.get(current_active_target) == current_sig:
+                    # 这条消息此前登记过「已处理」（可能是发送脱靶熔断/空回复），
+                    # 若它一直挂在待回复列表里，超过 TTL 必须允许重试，否则会永久静默卡死。
+                    _waited = now_ts - LAST_PROCESSED_AT.get(current_active_target, now_ts)
+                    if _waited >= 90.0:
+                        log(f"♻️ [超时重试] 好友【{current_active_target}】的消息已 {int(_waited)}s 未成功回复，清除登记后重试一次")
+                        LAST_PROCESSED_SIGNATURE.pop(current_active_target, None)
+                        SEND_FAIL_RETRY.pop(current_sig, None)
+                    else:
+                        _k = (current_active_target, "processed")
+                        if now_ts - SKIP_LOG_AT.get(_k, 0) >= 30.0:
+                            SKIP_LOG_AT[_k] = now_ts
+                            log(f"⏭️ [跳过] 好友【{current_active_target}】这条消息已登记处理过（{int(_waited)}s 前），若持续未回将在 90s 后自动重试: \"{combined_text[:24]}\"")
                 if LAST_PROCESSED_SIGNATURE.get(current_active_target) != current_sig:
                     # 🔒 Agent 在飞/待发闸门：同一条消息已经在后台思考或排队待发，本轮直接放行，
                     #    绝不再重复提交（否则每个心跳都会重复问 agent，烧额度还会乱序）。
@@ -3848,6 +3886,7 @@ def scan_and_reply_wechat(hwnd):
                         # 生成回复为空（如未填 Key 或 API 异常），记录告警并登记签名防空转
                         log(f"⚠️ [AI生成跳过] 好友【{current_active_target}】消息未获得有效AI回复 (API超时/网络抖动或未配Key)，登记签名防空转。")
                         LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
+                        LAST_PROCESSED_AT[current_active_target] = time.time()
 
                     # 本次已处理新消息，返回结束本轮调度
                     return
