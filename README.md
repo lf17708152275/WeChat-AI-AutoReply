@@ -418,6 +418,7 @@ WeChat-AI-AutoReply/
 ├── docs/                         # 设计/验证文档（Linux 移植、流程图、A2A 记录等）
 ├── assets/                       # 窗口/托盘图标
 ├── data/                         # 运行期配置与状态（gitignore：config/contexts/pid/pending）
+├── scripts/                      # 启动/运维小脚本（watch_log.sh 等）
 ├── logs/                         # 运行日志（gitignore）
 ├── dev/                          # 本机开发探针脚本与临时产物（gitignore）
 ├── requirements.txt / requirements_linux.txt
@@ -430,6 +431,28 @@ WeChat-AI-AutoReply/
 
 > 老的根目录布局（代码/配置/日志/探针脚本混在一起）已弃用。脚本一律从仓库根运行，
 > 源码在 `src/`、运行期数据在 `data/`、日志在 `logs/`。
+
+### 📜 不开 GUI 也能看日志
+
+bot 日志实时写在 `logs/wechat_bot_dev.log`（systemd 的原始 stdout 在 `logs/bot_stdout.log`）。
+终端里跟日志（带颜色），不用开 GUI：
+
+```bash
+bash scripts/watch_log.sh          # 跟随最新日志（红=告警、绿=成功、黄=语音、青=Agent、紫=巡检/跳过）
+bash scripts/watch_log.sh -e       # 只看告警/错误（脱靶、熔断、降级、超时…）
+bash scripts/watch_log.sh -n 300   # 从最后 300 行开始跟
+```
+
+也可以直接用系统命令：
+
+```bash
+tail -f logs/wechat_bot_dev.log              # 纯文本跟随
+tail -n 200 logs/wechat_bot_dev.log          # 看最近 200 行
+grep -E "⚠️|🚫|熔断|降级" logs/wechat_bot_dev.log | tail -50   # 只看异常
+```
+
+> 注：`journalctl --user -u wechat-bot -f` 只会显示 systemd 自己的消息，bot 的 stdout 已被重定向到
+> `logs/bot_stdout.log`，看业务日志请用上面的文件方式。
 
 ### 🧪 回归测试
 
