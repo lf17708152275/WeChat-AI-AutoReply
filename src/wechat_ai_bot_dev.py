@@ -986,6 +986,35 @@ BUILTIN_IGNORED_KEYWORDS = [
     "按住鼠标", "语音输入文字", "按住说话", "按Enter发送", "按Ctrl+Enter发送", "发送(S)"
 ]
 
+# 语音气泡的 OCR 文本形如 `) 2"`、`[语音 4"`、（悬停时还会带上「转文字」按钮）。
+# 开启微信「聊天中的语音消息自动转成文字」后，转写文字会紧贴在气泡下方，
+# 合并后会变成 `2"，晚上好呀……`。这里统一剥离时长/提示，保留转写正文。
+VOICE_DURATION_RE = re.compile(r'^[\s)\]}）】\[]*(?:\[语音\]\s*)?(\d{1,3})\s*["″”]\s*')
+VOICE_HINT_WORDS = ("转成文字", "语音转文字", "转文字")
+VOICE_ONLY_PLACEHOLDER = "（对方发来一条语音，暂时没转成文字）"
+
+
+def _normalize_voice_text(text):
+    """剥离语音气泡的时长与「转文字」提示。
+
+    返回 (clean_text, is_voice)。is_voice=True 表示这一行来自语音气泡；
+    clean_text 为空说明只有时长、没有转写文字（微信还没转出来）。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", False
+    is_voice = False
+    for hint in VOICE_HINT_WORDS:
+        if hint in t:
+            t = t.replace(hint, " ").strip()
+            is_voice = True
+    m = VOICE_DURATION_RE.match(t)
+    if m:
+        t = t[m.end():].strip()
+        is_voice = True
+    t = t.strip(" ，,。;；:：")
+    return t, is_voice
+
 def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
     arr = np.array(img_rgb)
     W, H = img_rgb.size
@@ -1040,27 +1069,41 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
             
             box_left = min(pt[0] for pt in b)
             box_right = max(pt[0] for pt in b)
-            
+
+            # 语音气泡：OCR 会读到时长（如 `) 2"`）与「转文字」提示。
+            # 剥离后若还剩文字，那是微信自动转写出来的正文；若为空说明还没转出来。
+            norm_text, is_voice = _normalize_voice_text(c_clean)
+            if not norm_text and not is_voice:
+                continue
+
             # 真彩底色判定：绿底 100% 我发，非绿底偏左侧 100% 好友发
             is_incoming = (not has_green_bg) and (box_left < (chat_start_x + int(0.55 * (W - chat_start_x))))
-            raw_lines.append((cy, box_left, box_right, is_incoming, c_clean))
+            raw_lines.append((cy, box_left, box_right, is_incoming, norm_text, is_voice))
             
     raw_lines.sort(key=lambda x: x[0])
     
     # 智能多行气泡垂直合并 (< 40px)
     merged_bubbles = []
-    for cy, b_left, b_right, is_inc, text in raw_lines:
+    for cy, b_left, b_right, is_inc, text, is_voice in raw_lines:
         if merged_bubbles and is_inc == merged_bubbles[-1]['is_incoming'] and abs(cy - merged_bubbles[-1]['last_y']) < 40:
-            merged_bubbles[-1]['text'] += "，" + text
+            if text:
+                prev = merged_bubbles[-1]
+                prev['text'] = (prev['text'] + "，" + text) if prev['text'] else text
             merged_bubbles[-1]['last_y'] = cy
+            merged_bubbles[-1]['box_left'] = min(merged_bubbles[-1]['box_left'], b_left)
+            merged_bubbles[-1]['box_right'] = max(merged_bubbles[-1]['box_right'], b_right)
+            merged_bubbles[-1]['is_voice'] = merged_bubbles[-1]['is_voice'] or is_voice
         else:
             merged_bubbles.append({
                 'is_incoming': is_inc,
                 'first_y': cy,
                 'last_y': cy,
+                'box_left': b_left,
+                'box_right': b_right,
+                'is_voice': is_voice,
                 'text': text
             })
-            
+
     return merged_bubbles
 
 def extract_pending_incoming_messages(chat_bubbles):
@@ -1083,9 +1126,42 @@ def extract_pending_incoming_messages(chat_bubbles):
     else:
         pending_bubbles = [b for b in chat_bubbles[last_outgoing_idx + 1:] if b['is_incoming']]
         
+    # 语音气泡若还没被微信转成文字（或转写失败），不要拿时长当正文丢给模型；
+    # 用明确占位符让模型自然地请对方重说/打字。
+    for b in pending_bubbles:
+        if b.get('is_voice') and not (b.get('text') or '').strip():
+            b['text'] = VOICE_ONLY_PLACEHOLDER
+
     texts = [b['text'].strip() for b in pending_bubbles if b['text'].strip()]
     combined_text = "，".join(texts)
     return pending_bubbles, combined_text
+
+
+def _retry_voice_transcript(hwnd, layout, ignored_keywords, pending_bubbles, wait_s=1.2, attempts=2):
+    """语音气泡只读到时长、还没转出文字时，等微信「自动转成文字」渲染后再扫一次。
+
+    返回 (pending_bubbles, combined_text) 或 None（没等到转写）。
+    """
+    for _ in range(max(1, attempts)):
+        time.sleep(wait_s)
+        try:
+            refetch = _scan_window(hwnd)
+        except Exception:
+            return None
+        if not refetch:
+            return None
+        img_new, layout_new, res_new, _title = refetch
+        if img_new is None:
+            return None
+        try:
+            bubbles_new = parse_chat_bubbles_chromatic(res_new, img_new, layout_new, ignored_keywords)
+            pending_new, combined_new = extract_pending_incoming_messages(bubbles_new)
+        except Exception:
+            return None
+        if pending_new and combined_new and combined_new != VOICE_ONLY_PLACEHOLDER:
+            if any((b.get('text') or '').strip() for b in pending_new):
+                return pending_new, combined_new
+    return None
 
 # =============================================================================
 # 6. LLM BRAIN & INSTANT PURE TEXT GENERATION (0 ARTIFICIAL LATENCY)
@@ -3694,6 +3770,16 @@ def scan_and_reply_wechat(hwnd):
         chat_bubbles = parse_chat_bubbles_chromatic(res, img_wechat, layout, ignored_keywords)
         if chat_bubbles:
             pending_bubbles, combined_text = extract_pending_incoming_messages(chat_bubbles)
+            # 🎤 语音消息：只看到时长、还没转出文字时，等微信自动转写后重扫一次
+            if pending_bubbles and any(
+                b.get('is_voice') and (b.get('text') or '').strip() == VOICE_ONLY_PLACEHOLDER
+                for b in pending_bubbles
+            ):
+                log(f"🎤 [语音] 收到【{current_active_target}】的语音，等待微信自动转文字…")
+                retried = _retry_voice_transcript(hwnd, layout, ignored_keywords, pending_bubbles)
+                if retried:
+                    pending_bubbles, combined_text = retried
+                    log(f"🎤 [语音] 已拿到转写：\"{combined_text}\"")
             # 🔥 第一道铁闸：只要当前好友有未回复新消息，绝对锁定在当前窗口就地秒回！
             if pending_bubbles and combined_text:
                 current_sig = _msg_signature(current_active_target, combined_text, pending_bubbles)

@@ -59,6 +59,12 @@ class _FakeNDArray(object):
     def __ge__(self, other):
         return self
 
+    def __and__(self, other):
+        return self
+
+    def __rand__(self, other):
+        return self
+
 
 _np = _stub("numpy")
 _np.array = lambda *a, **k: _FakeNDArray()
@@ -707,6 +713,31 @@ check_true("dsh-meme 图片能下载成文件", bool(_meme_file))
 if _meme_file:
     import os as _os
     _os.remove(_meme_file)
+
+
+print("=== 5.6b 收到的语音消息（时长剥离 + 微信自动转文字）===")
+check("语音气泡只剩时长→无正文", _wb._normalize_voice_text(') 2"，转文字'), ("", True))
+check("时长+转写→保留转写文字", _wb._normalize_voice_text('2"，晚上好呀，早点休息'), ("晚上好呀，早点休息", True))
+check("普通文字不误判成语音", _wb._normalize_voice_text("你好呀"), ("你好呀", False))
+
+from PIL import Image as _PILImage
+_voice_img = _PILImage.new("RGB", (1000, 760), (245, 245, 245))
+_voice_layout = {"sidebar_w": 200, "chat_start_x": 444, "header_h": 88, "input_h": 150,
+                 "total_w_px": 1000, "total_h_px": 760}
+_voice_res = [
+    ([[600, 300], [640, 300], [640, 320], [600, 320]], ') 2"', 0.9),
+    ([[600, 322], [820, 322], [820, 342], [600, 342]], "晚上好呀，早点休息", 0.9),
+]
+_voice_bubbles = _wb.parse_chat_bubbles_chromatic(_voice_res, _voice_img, _voice_layout)
+_voice_pending, _voice_combined = _wb.extract_pending_incoming_messages(_voice_bubbles)
+check("语音气泡保留几何坐标", (_voice_bubbles[0]["box_left"], _voice_bubbles[0]["box_right"]), (600, 820))
+check("自动转文字内容被当成消息正文", _voice_combined, "晚上好呀，早点休息")
+check_true("语音气泡被标记", _voice_bubbles[0].get("is_voice") is True)
+
+_voice_only_res = [([[600, 300], [640, 300], [640, 320], [600, 320]], ') 3"，转文字', 0.9)]
+_voice_only_bubbles = _wb.parse_chat_bubbles_chromatic(_voice_only_res, _voice_img, _voice_layout)
+_voice_only_pending, _voice_only_text = _wb.extract_pending_incoming_messages(_voice_only_bubbles)
+check("没转出文字时不拿时长当正文", _voice_only_text, _wb.VOICE_ONLY_PLACEHOLDER)
 
 
 print("=== 5.7 语音发送解析（voice 字段 / [语音: 文本] 标记）===")
