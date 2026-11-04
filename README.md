@@ -291,7 +291,8 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
 前置条件：
 
 1. DSH 已安装并启用 **dsh-breeze-tts** 插件（提供 `POST /dsh-breeze-tts-api/speak-preview`，返回 WAV）。
-2. 插件后端有 Breeze-TTS-2 服务：
+2. 插件后端有 Breeze-TTS-2 服务（**局域网里已有的那台也行**，比如 `http://192.168.31.141`，
+   把 `endpoint` 指过去即可，不必在本机装；本机装则参考下面命令）：
    ```bash
    breeze-server q4_k.gguf --host 127.0.0.1 --port 8080 --webui
    # 健康检查
