@@ -255,6 +255,37 @@ _saved_contract2 = json.load(open(tmp_cfg, encoding="utf-8"))
 check("内置契约=默认时存空串（跟随内置）",
       (_saved_contract2.get("agent") or {}).get("contract"), "")
 
+print("\n=== 3b-3b. 语音回复设置（固定音色，AI 引擎页） ===")
+check_true("AI 引擎设置页有音色选择框", hasattr(app, "cbo_voice_id"))
+check_true("有试听按钮", hasattr(app, "btn_voice_preview"))
+check_true("有发送方式下拉", hasattr(app, "cbo_voice_mode"))
+_voice_loaded = app._voice_cfg_dict()
+check_true("从配置载入了语音开关", isinstance(_voice_loaded.get("enabled"), bool))
+check_true("音色 id 是字符串", isinstance(_voice_loaded.get("voice"), str))
+
+app._apply_voice_choices([("cn_soft_female", "温柔年轻女声"), ("cn_deep_male", "低沉男声")], source="测试")
+check("音色下拉有 2 个候选", len(app.cbo_voice_id.cget("values")), 2)
+app.cbo_voice_id.set("cn_deep_male  —  低沉男声")
+check("下拉带描述时仍解析出 id", app._voice_id_value(), "cn_deep_male")
+check_true("状态栏显示可用音色数", "个音色可用" in app.lbl_voice_status.cget("text"))
+
+app.var_voice_enabled.set(True)
+app.var_voice_mode.set("file")
+app.cbo_voice_id.set("cn_soft_female  —  温柔年轻女声")
+app.save_ui_to_config(show_msg=False)
+_saved_voice = (json.load(open(tmp_cfg, encoding="utf-8")).get("agent") or {}).get("voice") or {}
+check("语音开关写入 agent.voice.enabled", _saved_voice.get("enabled"), True)
+check("发送方式写入 agent.voice.mode", _saved_voice.get("mode"), "file")
+check("音色 id 写入 agent.voice.voice", _saved_voice.get("voice"), "cn_soft_female")
+check_true("保存时保留其它语音参数（max_chars/timeout）",
+           int(_saved_voice.get("max_chars") or 0) >= 1)
+
+# 还原成载入前的值，避免影响后续用例
+app.var_voice_enabled.set(bool(_voice_loaded.get("enabled")))
+app.var_voice_mode.set(str(_voice_loaded.get("mode") or "bubble"))
+app.cbo_voice_id.set(str(_voice_loaded.get("voice") or ""))
+app.save_ui_to_config(show_msg=False)
+
 print("\n=== 3b-4. 通讯录「当前会话」实时同步 ===")
 _old_contacts = list(app.config_data.get("contacts") or [])
 _old_cache = app._agent_session_cache

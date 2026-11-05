@@ -3807,8 +3807,16 @@ def scan_and_reply_wechat(hwnd):
             current_active_target = re.split(r'\s+', clean_green, maxsplit=1)[0].strip()
     
     if not current_active_target:
+        # 只在「顶栏标题读不到」或「标题命中白名单却仍认不出」时告警；
+        # 非白名单会话（如文件传输助手）本来就该跳过，不然每 60s 刷屏。
+        _should_log = not active_right_title
+        if whitelist_mode and active_right_title:
+            try:
+                _should_log = bool(is_name_matched_strict(active_right_title, whitelist)[0])
+            except Exception:
+                _should_log = False
         _k = ("__target__", "none")
-        if now_ts - SKIP_LOG_AT.get(_k, 0) >= 60.0:
+        if _should_log and now_ts - SKIP_LOG_AT.get(_k, 0) >= 300.0:
             SKIP_LOG_AT[_k] = now_ts
             log(f"🔍 [巡检] 未识别当前好友：顶栏「{active_right_title or '空'}」 绿色会话「{(active_green_text or '')[:16]}」")
 

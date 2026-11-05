@@ -5,6 +5,7 @@ import time
 import re
 import tempfile
 import threading
+import subprocess
 import queue
 import urllib.error
 import urllib.parse
@@ -589,7 +590,24 @@ class WeChatBotGUI(tk.Tk):
 
     # 1. TAB: Engine
     def build_tab_engine(self):
-        engine_box = ttk.Frame(self.tab_engine)
+        # 内容比窗口高时滚动（语音卡片加进来后一屏放不下）
+        outer = ttk.Frame(self.tab_engine)
+        outer.pack(fill=tk.BOTH, expand=True)
+        self._engine_canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self._engine_canvas.yview)
+        self._engine_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._engine_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body = ttk.Frame(self._engine_canvas, padding=(0, 0, 6, 0))
+        self._engine_body = body
+        _win = self._engine_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: self._engine_canvas.configure(
+            scrollregion=self._engine_canvas.bbox("all")))
+        self._engine_canvas.bind("<Configure>", lambda e: self._engine_canvas.itemconfigure(
+            _win, width=e.width))
+
+
+        engine_box = ttk.Frame(body)
         engine_box.pack(fill=tk.X, pady=4)
 
         ttk.Label(engine_box, text="AI 响应引擎:", font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
@@ -599,7 +617,7 @@ class WeChatBotGUI(tk.Tk):
         rb2.pack(side=tk.LEFT)
 
         # OpenAI Group
-        self.grp_openai = ttk.LabelFrame(self.tab_engine, text=" 🌐 大模型 API 配置 ", padding=10)
+        self.grp_openai = ttk.LabelFrame(body, text=" 🌐 大模型 API 配置 ", padding=10)
         self.grp_openai.pack(fill=tk.X, pady=8)
 
         # Base URL
@@ -628,7 +646,7 @@ class WeChatBotGUI(tk.Tk):
         ttk.Label(row_model, text="(例如: deepseek-chat, gpt-4o-mini, qwen2.5:7b)", foreground="#666666", font=("微软雅黑", 8)).pack(side=tk.RIGHT)
 
         # Parameters Group
-        grp_params = ttk.LabelFrame(self.tab_engine, text=" ⚡ 回复格式与行为参数 ", padding=10)
+        grp_params = ttk.LabelFrame(body, text=" ⚡ 回复格式与行为参数 ", padding=10)
         grp_params.pack(fill=tk.X, pady=8)
 
         row_p1 = ttk.Frame(grp_params)
@@ -646,10 +664,49 @@ class WeChatBotGUI(tk.Tk):
         self.spin_delay.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(row_p2, text="秒 (模拟真实打字思考时间，防高频回复)").pack(side=tk.LEFT)
 
+        # ---- 语音回复（dsh-breeze-tts 插件）----
+        self.grp_voice = ttk.LabelFrame(body, text=" 🎙️ 语音回复（dsh-breeze-tts 插件） ", padding=10)
+        self.grp_voice.pack(fill=tk.X, pady=8)
+
+        row_v1 = ttk.Frame(self.grp_voice)
+        row_v1.pack(fill=tk.X, pady=4)
+        self.var_voice_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row_v1, text="启用语音回复（模型可在回复里带一条语音）",
+                        variable=self.var_voice_enabled).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(row_v1, text="发送方式:").pack(side=tk.LEFT)
+        self.var_voice_mode = tk.StringVar(value="bubble")
+        self.cbo_voice_mode = ttk.Combobox(row_v1, textvariable=self.var_voice_mode, state="readonly",
+                                           values=("bubble", "file"), width=8)
+        self.cbo_voice_mode.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(row_v1, text="(bubble=真语音气泡，file=音频文件消息)",
+                  foreground="#666666", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+
+        row_v2 = ttk.Frame(self.grp_voice)
+        row_v2.pack(fill=tk.X, pady=4)
+        ttk.Label(row_v2, text="音色 ID:").pack(side=tk.LEFT)
+        self.cbo_voice_id = ttk.Combobox(row_v2, state="normal", width=34)
+        self.cbo_voice_id.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(row_v2, text="🔄 刷新音色列表", command=self.refresh_voice_choices).pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_voice_preview = ttk.Button(row_v2, text="▶️ 试听", command=self.preview_voice)
+        self.btn_voice_preview.pack(side=tk.LEFT)
+
+        self.lbl_voice_status = ttk.Label(self.grp_voice, text="", foreground="#666666", font=("微软雅黑", 8))
+        self.lbl_voice_status.pack(fill=tk.X, pady=(2, 0))
+
+        ttk.Label(
+            self.grp_voice,
+            text="💡 音色留空时 Breeze 会按文本临时挑音色，可能出现男声/女声来回跳；建议选一个固定音色（如 cn_soft_female）。"
+                 "语音服务地址在 DSH 插件「设置 → 内置插件 → Breeze TTS」里配。",
+            foreground="#666666", font=("微软雅黑", 8), wraplength=1000, justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(2, 0))
+
         # Save Button
-        btn_save_frame = ttk.Frame(self.tab_engine)
+        btn_save_frame = ttk.Frame(body)
         btn_save_frame.pack(fill=tk.X, pady=10)
         ttk.Button(btn_save_frame, text="💾 保存所有配置并生效", command=self.save_ui_to_config).pack(side=tk.RIGHT)
+
+        # 滚轮：绑到 body 的所有子控件（Enter/Leave 的 bind_all 对子控件不触发）
+        self._bind_engine_wheel(self._engine_body)
 
     def toggle_api_key_visibility(self):
         if self.ent_api_key.cget("show") == "*":
@@ -662,7 +719,180 @@ class WeChatBotGUI(tk.Tk):
     def on_engine_change(self):
         pass
 
+    # ---- 语音回复（dsh-breeze-tts）-------------------------------------
+    VOICE_FALLBACK_CHOICES = (
+        ("cn_soft_female", "温柔年轻女声"),
+        ("cute_funny_female", "可爱搞笑女声"),
+        ("cn_narrator", "播报感女声"),
+        ("cn_deep_male", "低沉男声"),
+        ("sichuan_26year-girl", "四川话女声"),
+    )
+    DSH_TTS_VOICES_URL = "http://127.0.0.1:25675/dsh-breeze-tts-api/voices"
+
+    def _voice_defaults(self):
+        return {"enabled": False, "mode": "bubble", "voice": ""}
+
+    def _voice_id_value(self):
+        raw = ""
+        try:
+            raw = (self.cbo_voice_id.get() or "").strip()
+        except Exception:
+            raw = ""
+        if "  —  " in raw:
+            raw = raw.split("  —  ", 1)[0].strip()
+        return raw
+
+    def _voice_cfg_dict(self):
+        """合并配置里其它语音键（max_chars / timeout / 虚拟设备名…），只覆盖界面上的三项。"""
+        merged = dict(self._voice_defaults())
+        merged.update(dict((self.config_data.get("agent") or {}).get("voice") or {}))
+        try:
+            merged["enabled"] = bool(self.var_voice_enabled.get())
+            mode = (self.var_voice_mode.get() or "bubble").strip().lower()
+            merged["mode"] = mode if mode in ("bubble", "file") else "bubble"
+            merged["voice"] = self._voice_id_value()
+        except Exception:
+            pass
+        return merged
+
+    def _load_voice_settings(self):
+        voice = dict(self._voice_defaults())
+        voice.update(dict((self.config_data.get("agent") or {}).get("voice") or {}))
+        self.var_voice_enabled.set(bool(voice.get("enabled", False)))
+        mode = str(voice.get("mode") or "bubble").strip().lower()
+        self.var_voice_mode.set(mode if mode in ("bubble", "file") else "bubble")
+        vid = str(voice.get("voice") or "").strip()
+        self._voice_choices = list(self.VOICE_FALLBACK_CHOICES)
+        self._apply_voice_choices(self._voice_choices, source="内置列表")
+        self.cbo_voice_id.set(vid)
+        self._update_voice_status()
+        self._safe_after(1500, self.refresh_voice_choices)
+
+    def _update_voice_status(self, extra=""):
+        try:
+            vid = self._voice_id_value()
+            if vid:
+                text = f"当前音色：{vid}（固定）"
+            else:
+                text = "当前音色：未设置 —— Breeze 每次按文本临时挑，可能出现男/女声跳变"
+            if extra:
+                text += " · " + extra
+            self.lbl_voice_status.configure(text=text)
+        except Exception:
+            pass
+
+    def _apply_voice_choices(self, rows, source=""):
+        self._voice_choices = list(rows)
+        values = [f"{vid}  —  {desc}" if desc else str(vid) for vid, desc in rows]
+        try:
+            self.cbo_voice_id.configure(values=values)
+        except Exception:
+            return
+        self._update_voice_status(extra=f"{len(values)} 个音色可用（{source}）" if source else f"{len(values)} 个音色可用")
+
+    def refresh_voice_choices(self):
+        """后台拉取 Breeze 实时音色列表（失败就保留内置列表）。"""
+        try:
+            self.lbl_voice_status.configure(text="正在从 Breeze 拉取音色列表…")
+        except Exception:
+            pass
+
+        def worker():
+            rows = None
+            err = ""
+            try:
+                req = urllib.request.Request(self.DSH_TTS_VOICES_URL, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8") or "[]")
+                rows = []
+                for item in data if isinstance(data, list) else []:
+                    if isinstance(item, dict) and item.get("id"):
+                        rows.append((str(item["id"]), str(item.get("description") or "")))
+                if not rows:
+                    rows = None
+                    err = "返回为空"
+            except Exception as e:
+                err = str(e)[:100]
+
+            def apply():
+                if rows:
+                    self._apply_voice_choices(rows, source="Breeze 实时列表")
+                else:
+                    self._update_voice_status(extra=f"拉取失败（{err}），仍用内置列表")
+
+            self._ui_call(apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def preview_voice(self):
+        """用当前音色合成一句试听。"""
+        text = "你好呀，我是你的微信助手，今天过得怎么样？"
+        vid = self._voice_id_value()
+        try:
+            self.btn_voice_preview.configure(state=tk.DISABLED, text="⏳ 合成中…")
+            self.lbl_voice_status.configure(text=f"正在调用 Breeze 合成试听（音色：{vid or '默认'}）…")
+        except Exception:
+            pass
+
+        def worker():
+            tmp = ""
+            try:
+                payload = {"input": text}
+                if vid:
+                    payload["voice"] = vid
+                req = urllib.request.Request(
+                    "http://127.0.0.1:25675/dsh-breeze-tts-api/speak-preview",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    data = resp.read()
+                fd, tmp = tempfile.mkstemp(prefix="voice_preview_", suffix=".wav")
+                os.close(fd)
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                size_kb = len(data) / 1024.0
+                self._ui_call(lambda: self.lbl_voice_status.configure(
+                    text=f"✅ 试听音频已合成（{size_kb:.0f} KB），正在播放…"))
+                subprocess.run(["paplay", tmp], timeout=120, check=False)
+                self._ui_call(lambda: self._update_voice_status(extra="试听完成"))
+            except Exception as e:
+                msg = str(e)[:120]
+                self._ui_call(lambda: self.lbl_voice_status.configure(text=f"❌ 试听失败：{msg}"))
+            finally:
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                self._ui_call(lambda: self.btn_voice_preview.configure(state=tk.NORMAL, text="▶️ 试听"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # 2. TAB: Prompt
+
+    def _bind_engine_wheel(self, w):
+        """给「AI 引擎设置」页里所有子控件绑滚轮，滚轮在卡片上也能滚动整页。"""
+        canvas = getattr(self, "_engine_canvas", None)
+        if canvas is None:
+            return
+
+        def _wheel(event):
+            step = -1 if event.num == 4 else 1
+            canvas.yview_scroll(step * 3, "units")
+
+        def _hook(widget):
+            try:
+                widget.bind("<Button-4>", _wheel, add="+")
+                widget.bind("<Button-5>", _wheel, add="+")
+            except Exception:
+                pass
+            for ch in widget.winfo_children():
+                _hook(ch)
+
+        _hook(w)
+
     def build_tab_prompt(self):
         # 上下两栏可拖动：上=旧直连模型的人设 Prompt，下=A2A 决策契约（两栏各自滚动）
         pane = ttk.Panedwindow(self.tab_prompt, orient=tk.VERTICAL)
@@ -1383,6 +1613,8 @@ class WeChatBotGUI(tk.Tk):
             self.txt_contract.insert("1.0", self._contract_text_from_config())
         if hasattr(self, "var_persona_hint"):
             self.var_persona_hint.set(str((c.get("agent") or {}).get("persona_hint") or "").strip())
+        if hasattr(self, "cbo_voice_id"):
+            self._load_voice_settings()
 
         self.var_wl_mode.set(c.get("whitelist_mode", True))
         self.listbox_wl.delete(0, tk.END)
@@ -1461,6 +1693,8 @@ class WeChatBotGUI(tk.Tk):
         agent_merged["contract"] = self._contract_override()
         agent_merged["persona_hint"] = (self.var_persona_hint.get().strip()
                                         if hasattr(self, "var_persona_hint") else "")
+        if hasattr(self, "cbo_voice_id"):
+            agent_merged["voice"] = self._voice_cfg_dict()
         self.config_data["agent"] = agent_merged
 
         proactive_merged = dict(self.config_data.get("proactive_send") or {})
