@@ -265,7 +265,7 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
             "enabled": true,
             "mode": "bubble",
             "max_chars": 120,
-            "voice": "",
+            "voice": "cn_soft_female",
             "instruction": "",
             "edge_fallback": true,
             "edge_voice": "zh-CN-XiaoxuanNeural",
@@ -284,7 +284,7 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
 | --- | --- |
 | `enabled` | 总开关，默认 `false`（不打开就不会合成，也不会多花时间） |
 | `max_chars` | 超过这个字数的语音不再合成（省时省钱） |
-| `voice` / `instruction` | 传给 Breeze 的音色 id / 风格指令，留空用默认 |
+| `voice` / `instruction` | 传给 Breeze 的音色 id / 风格指令。**建议显式写死音色**：留空时 Breeze 会按文本临时挑音色，可能出现「一会儿男声一会儿女声」；填 `cn_soft_female`（温柔年轻女声）等固定 id 就稳定了 |
 | `edge_fallback` | Breeze 服务不可用时，是否退回 edge-tts（`/dsh-breeze-tts-api/speak`） |
 | `edge_voice` | edge-tts 的发音人 |
 | `timeout` | 合成超时（秒） |
@@ -292,6 +292,17 @@ Agent 可以在回复里夹带一条**语音**：模型按契约返回 `"voice":
 | `fallback_file` | 气泡发送失败时是否回退成文件消息 |
 | `virtual_source` / `virtual_sink` | 虚拟麦克风/空输出设备名（两处保持一致即可） |
 | `record_tail` / `min_record_seconds` | 录音尾巴、最短录音时长（微信拒绝太短的语音） |
+
+常用 Breeze 音色 id（用 `curl http://<Breeze主机>/v1/voices` 可看全量）：
+
+| id | 描述 |
+| --- | --- |
+| `cn_soft_female` | 温柔年轻女声（推荐，情感文案/陪聊） |
+| `cute_funny_female` | 可爱搞笑女声，轻快活泼 |
+| `cn_narrator` | 设计出的中文女声，适合旁白 |
+| `cn_deep_male` | 低沉磁性男声 |
+| `sichuan_26year-girl` | 四川话女声 |
+
 
 前置条件：
 

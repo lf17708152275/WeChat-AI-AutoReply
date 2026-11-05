@@ -62,7 +62,7 @@
       "enabled": false,
       "mode": "bubble",
       "max_chars": 120,
-      "voice": "",
+      "voice": "cn_soft_female",
       "instruction": "",
       "edge_fallback": true,
       "edge_voice": "zh-CN-XiaoxuanNeural",
