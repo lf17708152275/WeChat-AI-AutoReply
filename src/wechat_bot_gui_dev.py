@@ -872,26 +872,58 @@ class WeChatBotGUI(tk.Tk):
 
     # 2. TAB: Prompt
 
-    def _bind_engine_wheel(self, w):
-        """给「AI 引擎设置」页里所有子控件绑滚轮，滚轮在卡片上也能滚动整页。"""
-        canvas = getattr(self, "_engine_canvas", None)
-        if canvas is None:
-            return
+    def _make_scrollable_tab(self, tab):
+        """把整页内容套进「Canvas + 竖向滚动条」，返回内层 body（各控件用它当父容器）。"""
+        outer = ttk.Frame(tab)
+        outer.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+
+        def _body_wheel(event):
+            canvas.yview_scroll((-3 if event.num == 4 else 3), "units")
+
+        body.bind("<Button-4>", _body_wheel)
+        body.bind("<Button-5>", _body_wheel)
+        # 子控件是在 build 函数后续才创建的，等构建完再统一绑滚轮
+        try:
+            body.after(150, lambda: self._bind_tab_wheel(body, canvas))
+        except Exception:
+            pass
+        return body, canvas
+
+    def _bind_tab_wheel(self, widget, canvas):
+        """给一页的所有子控件绑滚轮；Treeview/Text/Listbox 等自带滚动的控件跳过。"""
+        skip = ("Treeview", "Text", "Listbox", "Canvas", "TCombobox", "Scrollbar")
 
         def _wheel(event):
             step = -1 if event.num == 4 else 1
             canvas.yview_scroll(step * 3, "units")
 
-        def _hook(widget):
+        def _hook(w):
             try:
-                widget.bind("<Button-4>", _wheel, add="+")
-                widget.bind("<Button-5>", _wheel, add="+")
+                if w.winfo_class() not in skip:
+                    w.bind("<Button-4>", _wheel, add="+")
+                    w.bind("<Button-5>", _wheel, add="+")
             except Exception:
                 pass
-            for ch in widget.winfo_children():
+            for ch in w.winfo_children():
                 _hook(ch)
 
-        _hook(w)
+        _hook(widget)
+
+    def _bind_engine_wheel(self, w):
+        """给「AI 引擎设置」页里所有子控件绑滚轮，滚轮在卡片上也能滚动整页。"""
+        canvas = getattr(self, "_engine_canvas", None)
+        if canvas is None:
+            return
+        self._bind_tab_wheel(w, canvas)
 
     def build_tab_prompt(self):
         # 上下两栏可拖动：上=旧直连模型的人设 Prompt，下=A2A 决策契约（两栏各自滚动）
@@ -1083,20 +1115,22 @@ class WeChatBotGUI(tk.Tk):
         self._sync_relation_urls()
 
     def build_tab_routes(self):
+        body_scroll, canvas = self._make_scrollable_tab(self.tab_routes)
+        self._bind_tab_wheel(body_scroll, canvas)
         ttk.Label(
-            self.tab_routes,
+            body_scroll,
             text="🔀 关系 → A2A 端点：每个关系绑一个 DSH A2A 入站端点（人格在端点的预设里选）",
             font=("微软雅黑", 9, "bold"),
         ).pack(anchor=tk.W)
         ttk.Label(
-            self.tab_routes,
+            body_scroll,
             text="· 通讯录里给好友选「关系」，他的消息就会发到这个关系对应的端点\n"
                  "· 改端点后，这个关系的人下一条消息自动走新端点（新端点 = 新会话）\n"
                  "· 没配关系的人走「默认端点」",
             foreground="#666666", font=("微软雅黑", 8), justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(2, 8))
 
-        body = ttk.Frame(self.tab_routes)
+        body = ttk.Frame(body_scroll)
         body.pack(fill=tk.BOTH, expand=True)
 
         right = ttk.LabelFrame(body, text=" 新增 / 编辑关系 ", padding=8)
@@ -1325,20 +1359,22 @@ class WeChatBotGUI(tk.Tk):
         messagebox.showinfo("已换新会话", f"{remark}\n下一条消息起使用：\n{data.get('context')}")
 
     def build_tab_contacts(self):
+        body_scroll, canvas = self._make_scrollable_tab(self.tab_contacts)
+        self._bind_tab_wheel(body_scroll, canvas)
         ttk.Label(
-            self.tab_contacts,
+            body_scroll,
             text="📇 备注 ↔ 微信号 映射表：填了微信号就优先用它去搜索找人；搜不到会自动降级用备注重搜。",
             font=("微软雅黑", 9, "bold"),
         ).pack(anchor=tk.W, pady=(0, 4))
         ttk.Label(
-            self.tab_contacts,
+            body_scroll,
             text="· 备注 = 微信里显示的名字（有备注就填备注，没有就填昵称）\n"
                  "· 微信号只有「你自己改过的」才能搜到；微信官方下发的 wxid_ 开头的搜不到，会自动降级用备注\n"
                  "· 这里的备注会自动并入白名单 —— 也就是说，填进来的人才会被自动回复",
             foreground="#666666", font=("微软雅黑", 8), justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 8))
 
-        body = ttk.Frame(self.tab_contacts)
+        body = ttk.Frame(body_scroll)
         body.pack(fill=tk.BOTH, expand=True)
 
         # 先 pack 固定宽度的右侧面板，再 pack 可伸缩的左侧列表，否则 expand 会把右侧挤出去
@@ -1460,7 +1496,9 @@ class WeChatBotGUI(tk.Tk):
 
     # 5. TAB: Agent brain & proactive send
     def build_tab_agent(self):
-        agent_box = ttk.LabelFrame(self.tab_agent, text=" 🤖 DSH Agent 大脑（由 Agent 决定回不回、回什么、什么时候回） ", padding=10)
+        body_scroll, canvas = self._make_scrollable_tab(self.tab_agent)
+        self._bind_tab_wheel(body_scroll, canvas)
+        agent_box = ttk.LabelFrame(body_scroll, text=" 🤖 DSH Agent 大脑（由 Agent 决定回不回、回什么、什么时候回） ", padding=10)
         agent_box.pack(fill=tk.X, pady=(0, 8))
 
         row_a0 = ttk.Frame(agent_box)
@@ -1495,7 +1533,7 @@ class WeChatBotGUI(tk.Tk):
         self.txt_agent_fallback = tk.Text(agent_box, height=4, font=("微软雅黑", 9), wrap=tk.WORD)
         self.txt_agent_fallback.pack(fill=tk.X, pady=(2, 0))
 
-        pro_box = ttk.LabelFrame(self.tab_agent, text=" 📤 主动发送接口（只监听本机，外部脚本 / Agent 主动发消息用） ", padding=10)
+        pro_box = ttk.LabelFrame(body_scroll, text=" 📤 主动发送接口（只监听本机，外部脚本 / Agent 主动发消息用） ", padding=10)
         pro_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         row_p0 = ttk.Frame(pro_box)
@@ -1538,7 +1576,7 @@ class WeChatBotGUI(tk.Tk):
         self.lbl_pro_status = ttk.Label(pro_box, text="接口状态：未检测", foreground="#666666", font=("微软雅黑", 8))
         self.lbl_pro_status.pack(anchor=tk.W, pady=(8, 0))
 
-        btn = ttk.Frame(self.tab_agent)
+        btn = ttk.Frame(body_scroll)
         btn.pack(fill=tk.X)
         ttk.Button(btn, text="💾 保存所有配置并生效", command=self.save_ui_to_config).pack(side=tk.RIGHT)
         ttk.Button(btn, text="🔄 刷新接口状态", command=self.refresh_proactive_status).pack(side=tk.RIGHT, padx=6)
